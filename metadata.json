@@ -1,0 +1,8 @@
+{
+  "name": "AI Architect & Builder IDE",
+  "description": "Mock interaction environment for an Architect vs Builder dual-Agent coding workflow.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
