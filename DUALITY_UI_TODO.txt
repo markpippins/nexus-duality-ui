@@ -1,0 +1,402 @@
+DUALITY UI — Mock-to-Real Alignment & Conversion Plan
+=====================================================
+Date: 2026-05-17
+Scope: nexus-duality (LOSM backend) ↔ nexus-duality-ui (React IDE)
+
+----------------------------------------------------------------------
+1.  CURRENT STATE OF EACH PROJECT
+----------------------------------------------------------------------
+
+1.1 Backend (nexus-duality) — LOSM v0.1 Kernel
+    Working: FastAPI app, /health, WorkRequest CRUD (create/get/list),
+             SQLite persistence, Alembic migration applied.
+    Broken:  Nothing — app runs, tests pass.
+    Missing: Phases 2-15 of the implementation plan. No PlanIR, SpecIR,
+             ExecutionIR (expanded), ValidationIR (expanded), CritiqueIR,
+             actors, services, runtime, DAG, LangGraph, WebSocket, trace
+             engine, branching, or MCTS. The SpecIR, ExecutionIR, and
+             ValidationIR files are minimal stubs.
+
+1.2 Frontend (nexus-duality-ui) — "AI Architect & Builder IDE"
+    Stack:   React 19 + Vite 6 + TypeScript 5.8 + Tailwind v4 +
+             RxJS (BehaviorSubject state) + Motion (animations) +
+             xterm.js (terminal) + lucide-react (icons) +
+             @google/genai (declared but UNUSED).
+    Layout:
+      ┌────────────────────────────────────────────┐
+      │  TopBar (Architect/Builder model pickers)  │
+      ├──────┬────────────────────────┬────────────┤
+      │      │ ArchitectChat          │ Builder    │
+      │Worksp│ (user ↔ architect      │ Stream     │
+      │Side  │  chat)                 │ (exec logs)│
+      │      ├────────────────────────┼────────────┤
+      │      │ TerminalPanel (xterm)  │ FileTree   │
+      │      │                        │ Sidebar    │
+      └──────┴────────────────────────┴────────────┘
+
+    Mock data: 2 workspaces, 3 file tree nodes, initial architect
+               greeting, empty builder logs.
+    Mock flow:  User types message → architect streams reply (char-by-char,
+                30ms interval) → builder executes fake 3.5s pipeline
+                (parse→handoff→manifest→generate→file create) → file tree
+                mutated with NewComponent.tsx.
+    State:      Singleton SimulatedBackendService with 5 BehaviorSubjects
+                (workspaces, activeWorkspace, fileTree, architectChat,
+                builderLogs) + 1 Subject (terminalOutput). React bridge
+                via useSimulation() hook.
+    No tests. 2 git commits.
+
+----------------------------------------------------------------------
+2.  CONCEPTUAL MISMATCH — UI Model vs Backend Model
+----------------------------------------------------------------------
+
+The current UI and the LOSM backend operate on fundamentally different
+mental models. This is the most important gap to address.
+
+UI's current model:
+  "User messages an Architect agent → Architect plans and delegates to
+   Builder agent → Builder generates files → File tree changes."
+
+LOSM backend model:
+  "User intent → WorkRequest → PlanIR → CritiqueIR → SpecIR → ExecutionIR
+   → ValidationIR. Each step is a typed, immutable artifact. State machine
+   governs transitions. Human approval gates at PLAN_APPROVAL_GATE."
+
+The UI's "Architect" role maps loosely to (PLAN_GENERATION + PLAN_REVIEW).
+The UI's "Builder" role maps loosely to (SPEC_GENERATION + EXECUTION).
+But the current implementation has NO artifact types, NO state machine,
+NO approval gates, NO validation step, and NO persistence.
+
+Two possible alignment strategies exist (decision needed):
+
+  STRATEGY A — "UI drives LOSM operator IDE"
+    Recast the UI as the Phase 11 Operator IDE from the LOSM
+    implementation plan. "Architect" and "Builder" become LOSM actor
+    roles within that IDE. The chat metaphor is replaced (or augmented)
+    by artifact inspection, state timeline, and transition controls.
+    The current mock is kept as an early visual prototype but re-architected.
+
+  STRATEGY B — "Two separate interfaces"
+    Keep the current UI as an architect/builder chat IDE (a front-end
+    for a different workflow). Build a separate LOSM operator IDE
+    (or add a tab/mode) that shows the state machine, artifacts, and
+    transition controls. This is more work but avoids forcing the
+    architect/builder metaphor into the LOSM state machine.
+
+Recommendation: Strategy A (single unified operator IDE). The UI already
+has the right layout (chat left, execution right, file tree, terminal,
+workspace). The main work is replacing the mock service and recasting
+the components to use LOSM types.
+
+----------------------------------------------------------------------
+3.  TYPE GAP — Current UI Types vs Target LOSM Types
+----------------------------------------------------------------------
+
+CURRENT UI TYPES (src/types.ts)          TARGET LOSM TYPES (impl plan)
+───────────────────────────────          ──────────────────────────────
+
+Workspace                              No direct equivalent; maps to
+  id: string                             a collection of WorkRequests
+  name: string                           or a session context. Could be
+  description: string                    tied to wr_id or project scope.
+
+FileNode                               No direct equivalent in core LOSM.
+  id: string                             The Operator IDE (Phase 11) spec
+  name: string                           mentions file tree as part of
+  type: 'file' | 'folder'                the execution runtime view — it's
+  children?: FileNode[]                  a UI concern, not a backend type.
+  content?: string                       Backend will need a file manifest
+  isOpen?: boolean                       endpoint for this.
+
+ChatMessage                             No direct equivalent. The LOSM
+  id: string                             operator IDE replaces free-form
+  role: 'user' | 'architect' |          chat with structured artifact
+        'builder' | 'system'             inspection + transition controls.
+  content: string                        "Chat" is demoted to a debug
+  timestamp: Date                        log view, not the primary UX.
+  isStreaming?: boolean
+
+AgentLog                                Maps to ExecutionIR.trace[] +
+  id: string                             ExecutionIR.step_results[] +
+  agent: 'architect' | 'builder'         transition events.
+  action: string                         LOSM has richer structure:
+  details: string                        per-step results, trace events
+  status: 'pending'|'success'|'error'    (enter/exit/error/retry), metrics,
+  timestamp: Date                        failure summaries.
+
+ProviderConfig                          Not a backend concern. Purely a
+  id: string                             UI configuration for selecting
+  name: string                           which LLM provider backs each
+  models: string[]                       LOSM actor (Planner, Critic, etc.)
+
+
+MISSING TYPES (needed but not in current UI):
+
+  WorkRequest        — central entity; user intent in → artifact out
+  PlanIR             — goal decomposition, execution steps, risks
+  SpecIR             — executable step graph with policies
+  ExecutionIR        — step results, trace events, metrics
+  ValidationIR       — scores, issues, recommendation
+  CritiqueIR         — issues, risk score, approve/revise/reject
+  TransitionEvent    — from→to state transitions
+  Artifact           — generic typed artifact with lineage
+
+----------------------------------------------------------------------
+4.  SERVICE GAP — Current Mock vs Real Backend
+----------------------------------------------------------------------
+
+SimulatedBackendService (current)       Real LOSM Backend (target)
+─────────────────────────────────       ──────────────────────────
+
+Uses singeton + RxJS BehaviorSubject    Uses FastAPI REST + WebSocket
+State is mutable (subjects.next())      State is persisted in SQLite/Postgres
+No types: everything is ad-hoc strings  Typed: all IR is Pydantic-validated
+
+Methods:                                 Endpoints needed:
+  sendUserMessage(content)                POST /work-requests/
+  simulateArchitectResponse(msg)          GET  /work-requests/{id}
+  simulateBuilderExecution()              GET  /work-requests/
+  setActiveWorkspace(ws)                  POST /work-requests/{id}/plan
+  addBuilderLog(...)                      POST /work-requests/{id}/critique
+                                          POST /work-requests/{id}/spec
+                                          POST /work-requests/{id}/execute
+                                          POST /work-requests/{id}/validate
+                                          GET  /artifacts/{id}/trace
+                                          WS   /ws/langgraph
+
+Data flow:                               Data flow:
+  user → architect chat → builder log    intent → PlanIR → CritiqueIR →
+  → file tree mutation                    SpecIR → ExecutionIR → ValidationIR
+                                          Each step is immutable, persisted,
+                                          and has a deterministic state
+                                          transition.
+
+----------------------------------------------------------------------
+5.  COMPONENT MAPPING — Current UI to Target LOSM IDE
+----------------------------------------------------------------------
+
+Current Component     Target Role in LOSM Operator IDE
+─────────────────     ────────────────────────────────
+
+TopBar                Keep but replace provider/model selector with
+                      actor routing config (which LLM serves Planner,
+                      which serves Critic, etc.)
+
+WorkspaceSidebar      Replace "workspace" concept with "WorkRequest list".
+                      Each item becomes a work request (intent, status,
+                      created_at). Active = current WR being processed.
+
+ArchitectChat         RECAST as "PlanView + ApprovalGate":
+                      - Left half: PlanIR tree (collapsible goal
+                        decomposition, execution steps with risk badges)
+                      - Right half: CritiqueIR overlay + Approve/Revise
+                        buttons
+                      - Chat log at bottom as a debug/history panel
+
+BuilderStream         RECAST as "ExecutionTrace + ValidationPanel":
+                      - Step-by-step execution results with status badges
+                      - Trace event log (enter/exit/error/retry)
+                      - Validation scores (intent alignment, compliance,
+                        correctness)
+                      - Recommendation action buttons (Complete, Retry,
+                        Replan)
+
+FileTreeSidebar       Keep — becomes the execution output viewer.
+                      Files created/modified during execution appear
+                      here. Backend will need a file manifest endpoint.
+
+TerminalPanel         Keep — becomes the live execution output stream.
+                      Shows raw logs from executor (Docker, shell, etc.).
+                      Already uses xterm.js which is ideal.
+
+----------------------------------------------------------------------
+6.  PHASED MIGRATION PLAN
+----------------------------------------------------------------------
+
+Phase 0 — Expand Mock Service to Cover All LOSM Types (NOW)
+  GOAL: The current mock only simulates architect chat → builder file
+        creation. Expand it to mock the full LOSM lifecycle so the UI
+        can be developed completely independently of the backend.
+  BACKEND STATUS: Phase 1 only (WorkRequest CRUD)
+  UI TASKS:
+  [ ] Add all missing LOSM types to src/types.ts:
+        WorkRequest, PlanIR, SpecIR, ExecutionIR, ValidationIR,
+        CritiqueIR, TransitionEvent, Artifact.
+  [ ] Expand SimulatedBackendService with methods mirroring every
+        backend endpoint (createWR, generatePlan, critiquePlan,
+        generateSpec, execute, validate, getTrace).
+  [ ] Seed realistic mock data for all LOSM types.
+  [ ] Add streaming simulation for LLM token generation in each step.
+  [ ] Add configurable delay and failure probability per step.
+  DELIVERABLE: Full mock backend the UI can drive end-to-end.
+
+Phase 1 — Recast UI Components to LOSM Types (IMMEDIATE)
+  GOAL: Replace architect/builder chat metaphor with artifact views,
+        state timeline, and approval controls. All data still from
+        mocks.
+  BACKEND STATUS: Phase 1
+  UI TASKS:
+  [ ] WorkspaceSidebar → WorkRequestList:
+        Show wr_id, intent preview, status badge, created_at.
+        Click selects active WR.
+  [ ] ArchitectChat → PlanView + ApprovalGate:
+        Show PlanIR tree (goal, steps, risks, assumptions).
+        Show CritiqueIR overlay (issues heatmap, risk score).
+        Approve/Revise/Reject buttons → trigger state transition.
+  [ ] BuilderStream → ExecutionView + ValidationPanel:
+        Show ExecutionIR step-by-step with status per step.
+        Show trace event log.
+        Show ValidationIR scores + recommendation.
+  [ ] Add StateTimeline component:
+        Horizontal clickable state bar across bottom or top.
+        States: NEW → PLAN → REVIEW → APPROVAL → SPEC → EXEC → VALIDATE
+        Current state highlighted. Clicking shows artifact for that state.
+  [ ] TerminalPanel: Keep but wire to backend logs.
+  [ ] FileTreeSidebar: Keep as execution output view.
+  [ ] TopBar: Replace provider/model picker with actor configuration.
+  DELIVERABLE: UI that can drive a full LOSM lifecycle end-to-end
+              (with mock data).
+
+Phase 2 — Wire WorkRequest CRUD to Real Backend
+  BACKEND STATUS: Phase 1 (already working)
+  UI TASKS:
+  [ ] Add ApiService class implementing same interface as MockService.
+  [ ] Replace mock WorkRequest methods with HTTP calls to backend.
+  [ ] Add error handling, loading states, retry logic.
+  [ ] Verify: UI creates/lists/views work requests from real SQLite DB.
+  DELIVERABLE: Real WorkRequest persistence visible in UI.
+
+Phase 3 — Wire PlanIR to Real Backend
+  BACKEND STATUS: Phase 2 (needs implementation)
+  UI TASKS:
+  [ ] Replace mock plan generation with real API call.
+  [ ] Verify plan tree renders real PlanIR from backend.
+  VERIFICATION: Backend Phase 2 must be done first.
+
+Phase 4 — Wire Execution + Validation to Real Backend
+  BACKEND STATUS: Phases 3-4 (needs implementation)
+  UI TASKS:
+  [ ] Replace mock execute/validate with real API calls.
+  [ ] Add live polling or streaming for execution progress.
+  VERIFICATION: Complete lifecycle works end-to-end with real backend.
+
+Phase 5 — Wire SpecIR + CritiqueIR to Real Backend
+  BACKEND STATUS: Phases 5-6 (needs implementation)
+  UI TASKS:
+  [ ] Replace mock spec/critique with real API calls.
+  [ ] Add approval gate interaction.
+  VERIFICATION: Full pipeline with critique loop works.
+
+Phase 6 — Wire State Machine + WebSocket
+  BACKEND STATUS: Phases 8, 12 (needs implementation)
+  UI TASKS:
+  [ ] Replace REST polling with WebSocket subscription.
+  [ ] Add live token streaming in execution views.
+  [ ] Add force transition, replay, inject feedback controls.
+  VERIFICATION: UI drives backend via WebSocket in real time.
+
+Phase 7 — Wire Trace Engine
+  BACKEND STATUS: Phase 13 (needs implementation)
+  UI TASKS:
+  [ ] Add artifact lineage graph view (React Flow / D3).
+  [ ] Add diff viewer for plan versions.
+  [ ] Add "Explain This Output" button.
+  VERIFICATION: Causal trace from any artifact back to intent.
+
+Phase 8 — Wire Branching + MCTS
+  BACKEND STATUS: Phases 14-15 (needs implementation)
+  UI TASKS:
+  [ ] Add branch tree visualization.
+  [ ] Add fork controls.
+  [ ] Add MCTS tree view with visit counts and best path.
+  VERIFICATION: Branching and MCTS work in UI.
+
+----------------------------------------------------------------------
+7.  MOCK-TO-REAL SERVICE ADAPTER PATTERN
+----------------------------------------------------------------------
+
+Define a common interface so mocks and real API adapters can coexist.
+Keep mocks available for frontend development when backend is behind.
+
+    interface LOSMApiService {
+      // WorkRequest
+      createWorkRequest(intent: string, metadata?: Record<string, any>): Promise<WorkRequest>;
+      getWorkRequest(id: string): Promise<WorkRequest>;
+      listWorkRequests(): Promise<WorkRequest[]>;
+
+      // Plan
+      generatePlan(wrId: string): Promise<PlanIR>;
+      getPlan(planId: string): Promise<PlanIR>;
+
+      // Critique
+      critiquePlan(planId: string): Promise<CritiqueIR>;
+      getCritique(critiqueId: string): Promise<CritiqueIR>;
+
+      // Spec
+      generateSpec(planId: string): Promise<SpecIR>;
+      getSpec(specId: string): Promise<SpecIR>;
+
+      // Execution
+      execute(specId: string): Promise<ExecutionIR>;
+      getExecution(executionId: string): Promise<ExecutionIR>;
+      getExecutionTrace(executionId: string): Promise<TraceEvent[]>;
+
+      // Validation
+      validate(executionId: string): Promise<ValidationIR>;
+      getValidation(validationId: string): Promise<ValidationIR>;
+
+      // State
+      getCurrentState(wrId: string): Promise<string>;
+      getTransitionHistory(wrId: string): Promise<TransitionEvent[]>;
+    }
+
+    // Implementations:
+    class MockLOSMApiService implements LOSMApiService { ... }
+    class HttpLOSMApiService implements LOSMApiService { ... }
+
+    // Selection based on backend availability:
+    const api: LOSMApiService =
+      import.meta.env.VITE_USE_MOCK === 'true'
+        ? new MockLOSMApiService()
+        : new HttpLOSMApiService();
+
+----------------------------------------------------------------------
+8.  CURRENT UI ISSUES TO FIX (short-term)
+----------------------------------------------------------------------
+
+[ ] @google/genai is in package.json but never imported. Remove or use.
+[ ] architectChat mock messages use 30ms char-by-char streaming — this
+    is fine for demo but will need the xterm streaming pattern for real
+    LLM output. Plan a unified streaming component.
+[ ] SimulatedBackendService mutates the mock file tree in-place (push
+    into INITIAL_FILE_TREE). This leaks state across renders. The
+    BehaviorSubject approach should use immutable updates.
+[ ] No error states anywhere in the UI — all mocks succeed. Add error
+    simulation to mocks and error display to all components.
+[ ] No loading states — mocks are instant (except char streaming). Add
+    skeleton/shimmer for when real API calls have latency.
+[ ] TerminalPanel assumes xterm.js is available — but it needs
+    xterm/css/style.css imported. Verify this works in build.
+[ ] No tests. At minimum add type-level tests verifying LOSM type
+    shapes match backend models.
+
+----------------------------------------------------------------------
+9.  SUMMARY OF WHAT MATTERS
+----------------------------------------------------------------------
+
+The current UI is a visually polished mock of a dual-agent IDE that does
+not yet connect to the LOSM backend. The main work is:
+
+  1. **RECAST THE UI COMPONENTS** to show LOSM artifacts instead of
+     architect/builder chat (Phase 1).
+  2. **EXPAND THE MOCK SERVICE** to cover all LOSM types so the UI can
+     drive the full intent→validation lifecycle even without the backend
+     (Phase 0).
+  3. **SYNC THE TYPES** between TypeScript and Pydantic models so
+     field names, shapes, and semantics match exactly.
+  4. **WIRE TO THE REAL BACKEND** phase-by-phase as the backend
+     implementation catches up (Phases 2-8).
+
+The TODO file at /home/codex/dev/nexus-duality/IMPLEMENTATION_PLAN_RECORD/
+contains the backend-side plan. Each UI phase above has a backend
+prerequisite — they must advance in lockstep.
