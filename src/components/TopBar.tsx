@@ -1,8 +1,18 @@
 import React, { useState } from 'react';
-import { Settings, Cpu, HardDrive } from 'lucide-react';
+import { Settings, Cpu, HardDrive, ChevronRight } from 'lucide-react';
 import { AVAILABLE_PROVIDERS } from '../services/SimulatedBackendService';
 
-export function TopBar() {
+interface BreadcrumbPart {
+  label: string;
+  icon: string;
+  level: string;
+}
+
+interface TopBarProps {
+  breadcrumbs?: BreadcrumbPart[];
+}
+
+export function TopBar({ breadcrumbs = [] }: TopBarProps) {
   const [archProvider, setArchProvider] = useState(AVAILABLE_PROVIDERS[0]);
   const [archModel, setArchModel] = useState(AVAILABLE_PROVIDERS[0].models[0]);
   
@@ -16,6 +26,24 @@ export function TopBar() {
           AC
         </div>
         <span className="font-semibold text-gray-100">AI Architect & Builder</span>
+
+        {/* Addressbar Breadcrumbs */}
+        {breadcrumbs.length > 0 && (
+          <div className="flex items-center ml-4 pl-4 border-l border-gray-700">
+            {breadcrumbs.map((part, i) => (
+              <React.Fragment key={`${part.level}-${part.label}`}>
+                {i > 0 && <ChevronRight className="w-3 h-3 text-gray-600 mx-1" />}
+                <span className={`text-xs px-1.5 py-0.5 rounded ${
+                  part.level === 'system' ? 'bg-blue-900/30 text-blue-300' :
+                  part.level === 'subsystem' ? 'bg-purple-900/30 text-purple-300' :
+                  'bg-emerald-900/30 text-emerald-300'
+                }`}>
+                  {part.label}
+                </span>
+              </React.Fragment>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="flex items-center space-x-6">
