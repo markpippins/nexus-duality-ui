@@ -3,8 +3,6 @@ import { WorkspaceSidebar } from './components/WorkspaceSidebar';
 import { ArchitectChat } from './components/ArchitectChat';
 import { BuilderStream } from './components/BuilderStream';
 import { FileTreeSidebar } from './components/FileTreeSidebar';
-import { TerminalPanel } from './components/TerminalPanel';
-
 const EVENT_BUS_URL = 'http://localhost:3200';
 
 export interface BreadcrumbPart {
@@ -69,9 +67,7 @@ export default function App() {
             <ArchitectChat />
             <BuilderStream />
           </div>
-          
-          {/* Bottom Panel */}
-          <TerminalPanel />
+
         </div>
 
         <FileTreeSidebar />
