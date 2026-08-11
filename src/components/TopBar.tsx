@@ -1,6 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Cpu, HardDrive, ChevronRight } from 'lucide-react';
-import { AVAILABLE_PROVIDERS } from '../services/SimulatedBackendService';
 
 interface BreadcrumbPart {
   label: string;
@@ -8,26 +7,53 @@ interface BreadcrumbPart {
   level: string;
 }
 
+interface TackleRole {
+  id: string;
+  name: string;
+  description: string;
+}
+
 interface TopBarProps {
   breadcrumbs?: BreadcrumbPart[];
 }
 
+const TACKLE_SRV = 'http://localhost:3410';
+const ROLES_URL = `${TACKLE_SRV}/roles`;
+
 export function TopBar({ breadcrumbs = [] }: TopBarProps) {
-  const [archProvider, setArchProvider] = useState(AVAILABLE_PROVIDERS[0]);
-  const [archModel, setArchModel] = useState(AVAILABLE_PROVIDERS[0].models[0]);
-  
-  const [buildProvider, setBuildProvider] = useState(AVAILABLE_PROVIDERS[1]);
-  const [buildModel, setBuildModel] = useState(AVAILABLE_PROVIDERS[1].models[0]);
+  const [roles, setRoles] = useState<TackleRole[]>([]);
+  const [leftRole, setLeftRole] = useState<string>('architect');
+  const [rightRole, setRightRole] = useState<string>('builder');
+
+  useEffect(() => {
+    fetch(ROLES_URL)
+      .then(r => r.json())
+      .then(data => {
+        const list: TackleRole[] = data.roles || [];
+        setRoles(list);
+        // Auto-select architect/builder if they exist
+        const arch = list.find(r => r.name === 'architect');
+        const build = list.find(r => r.name === 'builder');
+        if (arch) setLeftRole(arch.id);
+        if (build) setRightRole(build.id);
+      })
+      .catch(() => {
+        // Fallback: tackle-srv may not be running; keep defaults
+      });
+  }, []);
+
+  const leftRoleName = roles.find(r => r.id === leftRole)?.name || 'architect';
+  const rightRoleName = roles.find(r => r.id === rightRole)?.name || 'builder';
 
   return (
-    <div className="h-14 border-b border-gray-800 bg-gray-900 flex items-center justify-between px-4 text-sm text-gray-300">
+    <div className="h-14 border-b border-gray-800 bg-gray-900 flex items-center justify-between px-4 text-sm text-gray-300 shrink-0">
       <div className="flex items-center space-x-2">
         <div className="w-7 h-7 rounded-md bg-emerald-100 dark:bg-emerald-500/20 flex items-center justify-center flex-shrink-0">
           <svg className="w-4 h-4 text-emerald-600 dark:text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 7.125C2.25 6.504 2.754 6 3.375 6h6c.621 0 1.125.504 1.125 1.125v3.75c0 .621-.504 1.125-1.125 1.125h-6a1.125 1.125 0 01-1.125-1.125v-3.75zM14.25 8.625c0-.621.504-1.125 1.125-1.125h5.25c.621 0 1.125.504 1.125 1.125v8.25c0 .621-.504 1.125-1.125 1.125h-5.25a1.125 1.125 0 01-1.125-1.125v-8.25zM3.75 16.125c0-.621.504-1.125 1.125-1.125h5.25c.621 0 1.125.504 1.125 1.125v.75c0 .621-.504 1.125-1.125 1.125h-5.25a1.125 1.125 0 01-1.125-1.125v-.75z" />
           </svg>
         </div>
-        <span className="text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-widest select-none">Duality</span>
+        <span className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-widest select-none">Duality</span>
 
         {/* Addressbar Breadcrumbs */}
         {breadcrumbs.length > 0 && (
@@ -35,7 +61,7 @@ export function TopBar({ breadcrumbs = [] }: TopBarProps) {
             {breadcrumbs.map((part, i) => (
               <React.Fragment key={`${part.level}-${part.label}`}>
                 {i > 0 && <ChevronRight className="w-3 h-3 text-gray-600 mx-1" />}
-                <span className={`text-xs px-1.5 py-0.5 rounded ${
+                <span className={`text-sm px-1.5 py-0.5 rounded ${
                   part.level === 'system' ? 'bg-blue-900/30 text-blue-300' :
                   part.level === 'subsystem' ? 'bg-purple-900/30 text-purple-300' :
                   'bg-emerald-900/30 text-emerald-300'
@@ -49,54 +75,48 @@ export function TopBar({ breadcrumbs = [] }: TopBarProps) {
       </div>
 
       <div className="flex items-center space-x-6">
-        {/* Architect Selector */}
+        {/* Left Panel Agent Role Selector */}
         <div className="flex items-center space-x-2 bg-gray-800 px-3 py-1.5 rounded-md border border-gray-700">
           <Cpu className="w-4 h-4 text-blue-400" />
-          <span className="text-gray-400 text-xs uppercase tracking-wider">Architect</span>
-          <select 
+          <span className="text-gray-400 text-sm uppercase tracking-wider">Left Panel</span>
+          <select
             className="bg-transparent text-gray-200 outline-none cursor-pointer"
-            value={archProvider.id}
-            onChange={(e) => {
-              const p = AVAILABLE_PROVIDERS.find(x => x.id === e.target.value)!;
-              setArchProvider(p);
-              setArchModel(p.models[0]);
-            }}
+            value={leftRole}
+            onChange={(e) => setLeftRole(e.target.value)}
+            title={leftRoleName + ' — agent in left chat panel'}
           >
-            {AVAILABLE_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {roles.length === 0 && (
+              <option value={leftRole}>{leftRoleName}</option>
+            )}
+            {roles.map(r => (
+              <option key={r.id} value={r.id}>{r.name}</option>
+            ))}
           </select>
-          <span className="text-gray-600">/</span>
-          <select 
-            className="bg-transparent text-gray-200 outline-none cursor-pointer"
-            value={archModel}
-            onChange={(e) => setArchModel(e.target.value)}
-          >
-            {archProvider.models.map(m => <option key={m} value={m}>{m}</option>)}
-          </select>
+          <span className="text-[10px] text-gray-500 font-mono uppercase px-1.5 py-0.5 rounded bg-gray-700/50">
+            {leftRoleName}
+          </span>
         </div>
 
-        {/* Builder Selector */}
+        {/* Right Panel Agent Role Selector */}
         <div className="flex items-center space-x-2 bg-gray-800 px-3 py-1.5 rounded-md border border-gray-700">
           <HardDrive className="w-4 h-4 text-green-400" />
-          <span className="text-gray-400 text-xs uppercase tracking-wider">Builder</span>
-          <select 
+          <span className="text-gray-400 text-sm uppercase tracking-wider">Right Panel</span>
+          <select
             className="bg-transparent text-gray-200 outline-none cursor-pointer"
-            value={buildProvider.id}
-            onChange={(e) => {
-              const p = AVAILABLE_PROVIDERS.find(x => x.id === e.target.value)!;
-              setBuildProvider(p);
-              setBuildModel(p.models[0]);
-            }}
+            value={rightRole}
+            onChange={(e) => setRightRole(e.target.value)}
+            title={rightRoleName + ' — agent in right stream panel'}
           >
-            {AVAILABLE_PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            {roles.length === 0 && (
+              <option value={rightRole}>{rightRoleName}</option>
+            )}
+            {roles.map(r => (
+              <option key={r.id} value={r.id}>{r.name}</option>
+            ))}
           </select>
-          <span className="text-gray-600">/</span>
-          <select 
-            className="bg-transparent text-gray-200 outline-none cursor-pointer"
-            value={buildModel}
-            onChange={(e) => setBuildModel(e.target.value)}
-          >
-            {buildProvider.models.map(m => <option key={m} value={m}>{m}</option>)}
-          </select>
+          <span className="text-[10px] text-gray-500 font-mono uppercase px-1.5 py-0.5 rounded bg-gray-700/50">
+            {rightRoleName}
+          </span>
         </div>
       </div>
     </div>
