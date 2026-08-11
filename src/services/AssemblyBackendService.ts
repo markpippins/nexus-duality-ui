@@ -45,6 +45,8 @@ export class AssemblyBackendService {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private lastCommentCount = 0;
   private isSubmitting = false;
+  private watchCreated = false;
+  private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Configure which roles the left and right panels represent. */
   setRoles(left: string, right: string): void {
@@ -89,6 +91,10 @@ export class AssemblyBackendService {
     const data = await resp.json();
     this.threadId = data.id;
     localStorage.setItem('duality-thread-id', this.threadId);
+
+    // Create session watch so the subscriber knows to dispatch responses
+    await this.ensureWatch();
+
     this.startPolling();
     return this.threadId;
   }
@@ -164,6 +170,11 @@ export class AssemblyBackendService {
         });
       }
 
+      // Agent response arrived — clear the no-response timeout
+      if (role === this.leftRole || role === this.rightRole) {
+        this.clearNoResponseTimer();
+      }
+
       // Agent-to-agent delegation: left role's message that mentions right role
       if (role === this.leftRole && body.includes(`@${this.rightRole}`)) {
         rightLogs.push({
@@ -179,6 +190,59 @@ export class AssemblyBackendService {
 
     this.architectChatSubject.next(leftMessages);
     this.builderLogsSubject.next(rightLogs);
+  }
+
+  /** Ensure a session_watch exists for the current thread. */
+  private async ensureWatch(): Promise<void> {
+    if (this.watchCreated || !this.threadId) return;
+    try {
+      await fetch(`${ASSEMBLY_URL}/api/duality/watches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          threadId: this.threadId,
+          forumSlug: FORUM_SLUG,
+          role: this.leftRole,
+          executionBackend: 'freebuff',
+          maxTurns: 20,
+          idleTimeoutMs: 300_000,
+        }),
+      });
+      this.watchCreated = true;
+    } catch (err) {
+      console.error('[AssemblyBackend] Failed to create session watch:', err);
+      // Surface as a system message so the user sees the problem
+      const sysMsg: ChatMessage = {
+        id: 'err-watch-' + Date.now(),
+        role: 'system',
+        content: `⚠️  Could not create session watch for **${this.leftRole}** — the subscriber won't know to respond. Is assembly-srv running?`,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, sysMsg]);
+    }
+  }
+
+  /** Arm a no-response timer — if no agent reply arrives within 90s, surface an error. */
+  private armNoResponseTimer(): void {
+    this.clearNoResponseTimer();
+    this.noResponseTimer = setTimeout(() => {
+      const sysMsg: ChatMessage = {
+        id: 'err-timeout-' + Date.now(),
+        role: 'system',
+        content: `⏳  No response from **${this.leftRole}** within 90s. The subscriber daemon may be down or the role lease may be inactive. Check \`systemctl --user status cascade-interactive-turn\`.`,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, sysMsg]);
+    }, 90_000);
+  }
+
+  private clearNoResponseTimer(): void {
+    if (this.noResponseTimer) {
+      clearTimeout(this.noResponseTimer);
+      this.noResponseTimer = null;
+    }
   }
 
   /** Send a user message to the agent via Assembly. */
@@ -211,7 +275,10 @@ export class AssemblyBackendService {
         }),
       });
 
-      // 3. Poll immediately for the response (frontend polling handles
+      // 3. Arm timeout — surface error if no response within 90s
+      this.armNoResponseTimer();
+
+      // 4. Poll immediately for the response (frontend polling handles
       //    the case where the subscriber daemon isn't running yet)
       await this.pollThread();
     } catch (err) {
@@ -221,12 +288,13 @@ export class AssemblyBackendService {
     }
   }
 
-  /** Clean up polling on destroy. */
+  /** Clean up polling and timers on destroy. */
   destroy(): void {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.clearNoResponseTimer();
   }
 
   // ── Legacy workspace stubs (sidebar compatibility) ───
