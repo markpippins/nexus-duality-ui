@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { BackendService } from '../services/SimulatedBackendService';
+import { BackendService } from '../services/AssemblyBackendService';
 import { Workspace, FileNode, ChatMessage, AgentLog } from '../types';
 
 export function useSimulation() {
@@ -15,10 +15,13 @@ export function useSimulation() {
       BackendService.activeWorkspace$.subscribe(setActiveWorkspace),
       BackendService.fileTree$.subscribe(setFileTree),
       BackendService.architectChat$.subscribe(setArchitectChat),
-      BackendService.builderLogs$.subscribe(setBuilderLogs)
+      BackendService.builderLogs$.subscribe(setBuilderLogs),
     ];
 
-    return () => subs.forEach(s => s.unsubscribe());
+    return () => {
+      subs.forEach(s => s.unsubscribe());
+      BackendService.destroy();
+    };
   }, []);
 
   return {
@@ -27,6 +30,6 @@ export function useSimulation() {
     fileTree,
     architectChat,
     builderLogs,
-    BackendService
+    BackendService,
   };
 }

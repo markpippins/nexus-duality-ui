@@ -4,7 +4,11 @@ import { Activity, CheckCircle2, Clock, AlertCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 
-export function BuilderStream() {
+interface BuilderStreamProps {
+  role: string;
+}
+
+export function BuilderStream({ role }: BuilderStreamProps) {
   const { builderLogs } = useSimulation();
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -21,14 +25,18 @@ export function BuilderStream() {
     }
   };
 
+  const roleDisplayName = role.charAt(0).toUpperCase() + role.slice(1);
+
   return (
     <div className="flex-1 flex flex-col border-r border-gray-800 bg-[#0d1117] h-full relative font-mono">
       {/* Header */}
       <div className="h-10 border-b border-gray-800 flex items-center px-4 shrink-0 bg-gray-900/90 z-10">
-        <span className="text-xs font-bold text-gray-400 tracking-widest uppercase">Builder Stream</span>
+        <span className="text-sm font-bold text-gray-400 tracking-widest uppercase">
+          {roleDisplayName} Stream
+        </span>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-3 font-mono text-xs">
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 font-mono text-sm">
         {builderLogs.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-gray-600 space-y-3">
             <Activity className="w-8 h-8 opacity-20" />

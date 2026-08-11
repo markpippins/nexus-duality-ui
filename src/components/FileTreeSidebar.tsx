@@ -53,7 +53,7 @@ export function FileTreeSidebar() {
     <div className="w-64 h-full border-l border-gray-800 bg-gray-900/50 flex flex-col">
       <div className="flex items-center px-4 py-3 border-b border-gray-800/50">
         <AlignLeft className="w-4 h-4 text-gray-500 mr-2" />
-        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Explorer</span>
+        <span className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Explorer</span>
       </div>
       <div className="flex-1 overflow-y-auto p-2">
         {fileTree.map(node => (

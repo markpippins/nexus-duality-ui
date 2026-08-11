@@ -4,10 +4,20 @@ import { Send, User, Cpu } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 
-export function ArchitectChat() {
+interface ArchitectChatProps {
+  role: string;
+  rightRole?: string;
+}
+
+export function ArchitectChat({ role, rightRole = 'builder' }: ArchitectChatProps) {
   const { architectChat, BackendService } = useSimulation();
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Update the service when roles change
+  useEffect(() => {
+    BackendService.setRoles(role, rightRole);
+  }, [role, rightRole]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -20,23 +30,27 @@ export function ArchitectChat() {
     setInput('');
   };
 
+  const roleDisplayName = role.charAt(0).toUpperCase() + role.slice(1);
+
   return (
     <div className="flex-1 flex flex-col border-r border-gray-800 bg-gray-900 h-full relative">
       {/* Header */}
       <div className="h-10 border-b border-gray-800 flex items-center px-4 shrink-0 bg-gray-900/90 z-10">
-        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Architect Chat</span>
+        <span className="text-sm font-semibold text-gray-400 uppercase tracking-wider">
+          {roleDisplayName} Chat
+        </span>
       </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-6">
         <AnimatePresence initial={false}>
           {architectChat.map(msg => (
-            <motion.div 
+            <motion.div
               key={msg.id}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               className={cn(
-                "flex space-x-3 max-w-[90%]", 
+                "flex space-x-3 max-w-[90%]",
                 msg.role === 'user' ? "ml-auto flex-row-reverse space-x-reverse" : "mr-auto"
               )}
             >
@@ -46,7 +60,7 @@ export function ArchitectChat() {
               )}>
                 {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : <Cpu className="w-4 h-4 text-white" />}
               </div>
-              
+
               <div className={cn(
                 "rounded-lg p-3 text-sm",
                 msg.role === 'user' ? "bg-blue-600/20 text-blue-50" : "bg-gray-800 text-gray-200 border border-gray-700"
@@ -63,14 +77,14 @@ export function ArchitectChat() {
       {/* Input */}
       <div className="p-4 shrink-0 bg-gray-900">
         <form onSubmit={handleSend} className="relative flex items-center">
-          <input 
+          <input
             type="text"
             className="w-full bg-gray-800 border border-gray-700 rounded-md py-2.5 pl-4 pr-12 text-sm text-gray-200 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all placeholder:text-gray-500"
-            placeholder="Describe what you want to build..."
+            placeholder={`Message ${roleDisplayName}...`}
             value={input}
             onChange={e => setInput(e.target.value)}
           />
-          <button 
+          <button
             type="submit"
             disabled={!input.trim()}
             className="absolute right-2 p-1.5 rounded bg-blue-600 text-white disabled:bg-gray-700 disabled:text-gray-400 transition-colors"

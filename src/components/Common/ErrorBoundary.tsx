@@ -41,7 +41,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
               A component crashed during rendering. This is likely a transient data issue.
             </p>
             {this.state.error && (
-              <pre className="text-xs text-left text-red-600 dark:text-red-400 bg-slate-100 dark:bg-slate-950 p-2 rounded mb-4 max-h-32 overflow-auto font-mono">
+              <pre className="text-sm text-left text-red-600 dark:text-red-400 bg-slate-100 dark:bg-slate-950 p-2 rounded mb-4 max-h-32 overflow-auto font-mono">
                 {this.state.error.message}
               </pre>
             )}
@@ -52,7 +52,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
               <RefreshCw className="w-4 h-4" />
               Reload Application
             </button>
-            <p className="text-xs text-slate-500 dark:text-slate-500 mt-3">
+            <p className="text-sm text-slate-500 dark:text-slate-500 mt-3">
               If this persists, check the browser console (F12) for details.
             </p>
           </div>

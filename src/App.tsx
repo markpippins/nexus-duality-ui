@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { WorkspaceSidebar } from './components/WorkspaceSidebar';
 import { ArchitectChat } from './components/ArchitectChat';
 import { BuilderStream } from './components/BuilderStream';
@@ -39,6 +39,10 @@ export default function App() {
   // Apply the initial theme on mount (before SSE delivers the first event)
   applyTheme(getInitialTheme());
 
+  // Role state — lifted from TopBar so ArchitectChat and BuilderStream can use it
+  const [leftRole, setLeftRole] = useState<string>('architect');
+  const [rightRole, setRightRole] = useState<string>('builder');
+
   // Connect to the UI event bus and subscribe to theme changes
   useEffect(() => {
     const es = new EventSource(`${EVENT_BUS_URL}/api/events/stream?sender=duality-ui`);
@@ -59,15 +63,20 @@ export default function App() {
 
   return (
     <div className="h-screen w-screen flex flex-col bg-gray-950 font-sans overflow-hidden text-gray-100">
-      <TopBar />
+      <TopBar
+        leftRole={leftRole}
+        rightRole={rightRole}
+        onLeftRoleChange={setLeftRole}
+        onRightRoleChange={setRightRole}
+      />
       <div className="flex-1 flex overflow-hidden">
         <WorkspaceSidebar />
-        
+
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Main IDE Area */}
           <div className="flex-1 flex overflow-hidden">
-            <ArchitectChat />
-            <BuilderStream />
+            <ArchitectChat role={leftRole} />
+            <BuilderStream role={rightRole} />
           </div>
 
         </div>

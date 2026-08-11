@@ -15,15 +15,23 @@ interface TackleRole {
 
 interface TopBarProps {
   breadcrumbs?: BreadcrumbPart[];
+  leftRole: string;
+  rightRole: string;
+  onLeftRoleChange: (role: string) => void;
+  onRightRoleChange: (role: string) => void;
 }
 
 const TACKLE_SRV = 'http://localhost:3410';
 const ROLES_URL = `${TACKLE_SRV}/roles`;
 
-export function TopBar({ breadcrumbs = [] }: TopBarProps) {
+export function TopBar({
+  breadcrumbs = [],
+  leftRole,
+  rightRole,
+  onLeftRoleChange,
+  onRightRoleChange,
+}: TopBarProps) {
   const [roles, setRoles] = useState<TackleRole[]>([]);
-  const [leftRole, setLeftRole] = useState<string>('architect');
-  const [rightRole, setRightRole] = useState<string>('builder');
 
   useEffect(() => {
     fetch(ROLES_URL)
@@ -31,11 +39,11 @@ export function TopBar({ breadcrumbs = [] }: TopBarProps) {
       .then(data => {
         const list: TackleRole[] = data.roles || [];
         setRoles(list);
-        // Auto-select architect/builder if they exist
+        // Auto-select architect/builder if they exist and not already set
         const arch = list.find(r => r.name === 'architect');
         const build = list.find(r => r.name === 'builder');
-        if (arch) setLeftRole(arch.id);
-        if (build) setRightRole(build.id);
+        if (arch && !leftRole) onLeftRoleChange(arch.id);
+        if (build && !rightRole) onRightRoleChange(build.id);
       })
       .catch(() => {
         // Fallback: tackle-srv may not be running; keep defaults
@@ -82,7 +90,7 @@ export function TopBar({ breadcrumbs = [] }: TopBarProps) {
           <select
             className="bg-transparent text-gray-200 outline-none cursor-pointer"
             value={leftRole}
-            onChange={(e) => setLeftRole(e.target.value)}
+            onChange={(e) => onLeftRoleChange(e.target.value)}
             title={leftRoleName + ' — agent in left chat panel'}
           >
             {roles.length === 0 && (
@@ -104,7 +112,7 @@ export function TopBar({ breadcrumbs = [] }: TopBarProps) {
           <select
             className="bg-transparent text-gray-200 outline-none cursor-pointer"
             value={rightRole}
-            onChange={(e) => setRightRole(e.target.value)}
+            onChange={(e) => onRightRoleChange(e.target.value)}
             title={rightRoleName + ' — agent in right stream panel'}
           >
             {roles.length === 0 && (
