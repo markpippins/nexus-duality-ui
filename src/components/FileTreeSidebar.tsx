@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useSimulation } from '../hooks/useSimulation';
-import { File, Folder, ChevronRight, ChevronDown, AlignLeft } from 'lucide-react';
+import { File, Folder, ChevronRight, ChevronDown, ChevronLeft, AlignLeft } from 'lucide-react';
 import { FileNode } from '../types';
 import { cn } from '../lib/utils';
 
@@ -48,12 +48,24 @@ function TreeNode({ node, depth = 0 }: { node: FileNode, depth?: number }) {
 
 export function FileTreeSidebar() {
   const { fileTree } = useSimulation();
+  // Collapsed by default — sidebar is a placeholder stub until populated (see To Do roadmap)
+  const [collapsed, setCollapsed] = useState(true);
+
+  if (collapsed) {
+    return (
+      <div className="w-12 h-full border-l border-gray-800 bg-gray-900/50 flex flex-col items-center py-4 cursor-pointer" onClick={() => setCollapsed(false)}>
+        <ChevronLeft className="w-5 h-5 text-gray-400 mb-4" />
+        <AlignLeft className="w-5 h-5 text-gray-500" />
+      </div>
+    );
+  }
 
   return (
     <div className="w-64 h-full border-l border-gray-800 bg-gray-900/50 flex flex-col">
-      <div className="flex items-center px-4 py-3 border-b border-gray-800/50">
+      <div className="flex items-center px-4 py-3 border-b border-gray-800/50 hover:bg-gray-800/20 cursor-pointer" onClick={() => setCollapsed(true)}>
         <AlignLeft className="w-4 h-4 text-gray-500 mr-2" />
         <span className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Explorer</span>
+        <ChevronDown className="w-4 h-4 text-gray-500 ml-auto" />
       </div>
       <div className="flex-1 overflow-y-auto p-2">
         {fileTree.map(node => (

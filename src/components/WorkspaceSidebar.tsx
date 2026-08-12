@@ -5,7 +5,8 @@ import { cn } from '../lib/utils';
 
 export function WorkspaceSidebar() {
   const { workspaces, activeWorkspace, BackendService } = useSimulation();
-  const [collapsed, setCollapsed] = useState(false);
+  // Collapsed by default — sidebars are placeholder stubs until populated (see To Do roadmap)
+  const [collapsed, setCollapsed] = useState(true);
 
   if (collapsed) {
     return (
