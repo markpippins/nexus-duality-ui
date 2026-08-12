@@ -14,9 +14,16 @@ export function ArchitectChat({ role, rightRole = 'builder' }: ArchitectChatProp
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Update the service when roles change
+  // Set roles and load session on mount (even if default role is already selected)
   useEffect(() => {
     BackendService.setRoles(role, rightRole);
+    BackendService.ensureThread().catch(() => {});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When roles change (user switches dropdown), reset thread and re-query
+  useEffect(() => {
+    BackendService.setRoles(role, rightRole);
+    BackendService.ensureThread().catch(() => {});
   }, [role, rightRole]);
 
   useEffect(() => {

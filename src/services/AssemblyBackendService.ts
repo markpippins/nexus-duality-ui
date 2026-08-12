@@ -48,30 +48,48 @@ export class AssemblyBackendService {
   private watchCreated = false;
   private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
 
-  /** Configure which roles the left and right panels represent. */
+  /** Configure which roles the left and right panels represent.
+   *  Resets session state so ensureThread re-queries for the new role's active watch. */
   setRoles(left: string, right: string): void {
+    if (this.leftRole === left && this.rightRole === right) return;
     this.leftRole = left;
     this.rightRole = right;
+    // Reset so ensureThread() re-queries the server for the new role's watch
+    this.threadId = null;
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    // Stop polling on the old thread
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
   }
 
-  /** Create or resume a session thread. Returns the thread ID. */
-  private async ensureThread(): Promise<string> {
+  /** Create or resume a session thread. Returns the thread ID.
+   *  Public so ArchitectChat can call it on mount for immediate session load. */
+  async ensureThread(): Promise<string> {
     if (this.threadId) return this.threadId;
 
-    // Try to resume from localStorage
-    const saved = localStorage.getItem('duality-thread-id');
-    if (saved) {
-      try {
-        const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${saved}`);
-        if (resp.ok) {
-          this.threadId = saved;
-          this.startPolling();
-          await this.loadThreadHistory();
-          return this.threadId;
+    // Try server-side session lookup (survives browser clears / iframe reloads)
+    try {
+      const resp = await fetch(
+        `${ASSEMBLY_URL}/api/duality/watches/active?role=${encodeURIComponent(this.leftRole)}&forumSlug=${encodeURIComponent(FORUM_SLUG)}`
+      );
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.threadId) {
+          // Verify thread still exists
+          const threadResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${data.threadId}`);
+          if (threadResp.ok) {
+            this.threadId = data.threadId;
+            this.startPolling();
+            await this.loadThreadHistory();
+            return this.threadId;
+          }
         }
-      } catch {
-        localStorage.removeItem('duality-thread-id');
       }
+    } catch {
+      // Server lookup failed — fall through to create new thread
     }
 
     // Create new thread
@@ -90,7 +108,6 @@ export class AssemblyBackendService {
     if (!resp.ok) throw new Error(`Failed to create thread: ${resp.status}`);
     const data = await resp.json();
     this.threadId = data.id;
-    localStorage.setItem('duality-thread-id', this.threadId);
 
     // Create session watch so the subscriber knows to dispatch responses
     await this.ensureWatch();
@@ -148,8 +165,11 @@ export class AssemblyBackendService {
       const timestamp = new Date(c.createdAt);
       const body = c.body || '';
 
-      // Messages from the left-panel role or user → ArchitectChat
-      if (role === this.leftRole || role === 'user' || role === 'system') {
+      // Messages from the left-panel role or user → ArchitectChat.
+      // NOTE: system-role comments (the turn-request notifications like
+      // "@analyst — new message awaits your response") are deliberately
+      // excluded — they're pipeline noise, not conversation.
+      if (role === this.leftRole || role === 'user') {
         leftMessages.push({
           id: c.id,
           role: role === 'user' ? 'user' : 'architect',

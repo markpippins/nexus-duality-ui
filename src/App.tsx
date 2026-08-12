@@ -40,7 +40,7 @@ export default function App() {
   applyTheme(getInitialTheme());
 
   // Role state — lifted from TopBar so ArchitectChat and BuilderStream can use it
-  const [leftRole, setLeftRole] = useState<string>('architect');
+  const [leftRole, setLeftRole] = useState<string>('analyst');
   const [rightRole, setRightRole] = useState<string>('builder');
 
   // Connect to the UI event bus and subscribe to theme changes
