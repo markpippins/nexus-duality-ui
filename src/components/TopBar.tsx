@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { Cpu, HardDrive, ChevronRight, Zap } from 'lucide-react';
-import { ExecutionBackend } from '../services/AssemblyBackendService';
+import React from 'react';
+import { ChevronRight } from 'lucide-react';
+import { SubscriberStatus } from './SubscriberStatus';
 
 interface BreadcrumbPart {
   label: string;
@@ -8,61 +8,16 @@ interface BreadcrumbPart {
   level: string;
 }
 
-interface TackleRole {
-  id: string;
-  name: string;
-  description: string;
-}
-
 interface TopBarProps {
   breadcrumbs?: BreadcrumbPart[];
-  leftRole: string;
-  rightRole: string;
-  executionBackend: ExecutionBackend;
-  onLeftRoleChange: (role: string) => void;
-  onRightRoleChange: (role: string) => void;
-  onExecutionBackendChange: (backend: ExecutionBackend) => void;
 }
 
-const TACKLE_SRV = 'http://localhost:3410';
-const ROLES_URL = `${TACKLE_SRV}/roles`;
-
-export function TopBar({
-  breadcrumbs = [],
-  leftRole,
-  rightRole,
-  executionBackend,
-  onLeftRoleChange,
-  onRightRoleChange,
-  onExecutionBackendChange,
-}: TopBarProps) {
-  const [roles, setRoles] = useState<TackleRole[]>([]);
-
-  useEffect(() => {
-    fetch(ROLES_URL)
-      .then(r => r.json())
-      .then(data => {
-        const list: TackleRole[] = data.roles || [];
-        setRoles(list);
-        // Auto-select architect/builder if they exist and not already set
-        const arch = list.find(r => r.name === 'architect');
-        const build = list.find(r => r.name === 'builder');
-        if (arch && !leftRole) onLeftRoleChange(arch.name);
-        if (build && !rightRole) onRightRoleChange(build.name);
-      })
-      .catch(() => {
-        // Fallback: tackle-srv may not be running; keep defaults
-      });
-  }, []);
-
-  // Select values are role NAMES (not the tackle.roles UUID id): the whole
-  // backend — tackle.config_bundle, role_leases, harness-srv, and the turn
-  // subscriber — keys on the role name. Using r.id here made harness runs
-  // fail with 'no active config_bundle found for <uuid>'. Display names are
-  // therefore just the values themselves with a fallback.
-  const leftRoleName = leftRole || 'architect';
-  const rightRoleName = rightRole || 'builder';
-
+/**
+ * Brand bar only. Per-panel controls (agent role selector + leased/harness
+ * execution-mode switch) live in each panel's own header — see PanelControls —
+ * so each agent has its controls directly above its panel.
+ */
+export function TopBar({ breadcrumbs = [] }: TopBarProps) {
   return (
     <div className="h-14 border-b border-gray-800 bg-gray-900 flex items-center justify-between px-4 text-sm text-gray-300 shrink-0">
       <div className="flex items-center space-x-2">
@@ -92,77 +47,9 @@ export function TopBar({
         )}
       </div>
 
-      <div className="flex items-center space-x-6">
-        {/* Left Panel Agent Role Selector */}
-        <div className="flex items-center space-x-2 bg-gray-800 px-3 py-1.5 rounded-md border border-gray-700">
-          <Cpu className="w-4 h-4 text-blue-400" />
-          <span className="text-gray-400 text-sm uppercase tracking-wider">Left Panel</span>
-          <select
-            className="bg-transparent text-gray-200 outline-none cursor-pointer"
-            value={leftRole}
-            onChange={(e) => onLeftRoleChange(e.target.value)}
-            title={leftRoleName + ' — agent in left chat panel'}
-          >
-            {roles.length === 0 && (
-              <option value={leftRole}>{leftRoleName}</option>
-            )}
-            {roles.map(r => (
-              <option key={r.id} value={r.name}>{r.name}</option>
-            ))}
-          </select>
-          <span className="text-[10px] text-gray-500 font-mono uppercase px-1.5 py-0.5 rounded bg-gray-700/50">
-            {leftRoleName}
-          </span>
-        </div>
-
-        {/* Right Panel Agent Role Selector */}
-        <div className="flex items-center space-x-2 bg-gray-800 px-3 py-1.5 rounded-md border border-gray-700">
-          <HardDrive className="w-4 h-4 text-green-400" />
-          <span className="text-gray-400 text-sm uppercase tracking-wider">Right Panel</span>
-          <select
-            className="bg-transparent text-gray-200 outline-none cursor-pointer"
-            value={rightRole}
-            onChange={(e) => onRightRoleChange(e.target.value)}
-            title={rightRoleName + ' — agent in right stream panel'}
-          >
-            {roles.length === 0 && (
-              <option value={rightRole}>{rightRoleName}</option>
-            )}
-            {roles.map(r => (
-              <option key={r.id} value={r.name}>{r.name}</option>
-            ))}
-          </select>
-          <span className="text-[10px] text-gray-500 font-mono uppercase px-1.5 py-0.5 rounded bg-gray-700/50">
-            {rightRoleName}
-          </span>
-        </div>
-
-        {/* Execution Backend Selector — applies to NEW sessions */}
-        <div
-          className="flex items-center space-x-2"
-          title={
-            'Execution backend for new sessions: Freebuff = interactive turn ' +
-            '(session owns context); Harness = ephemeral opencode run via harness-srv'
-          }
-        >
-          <Zap className="w-4 h-4 text-amber-400" />
-          <div className="flex bg-gray-800 rounded-md border border-gray-700 p-0.5">
-            {(['freebuff', 'harness'] as const).map(b => (
-              <button
-                key={b}
-                onClick={() => onExecutionBackendChange(b)}
-                className={
-                  'px-2.5 py-1 text-xs font-medium rounded transition-colors ' +
-                  (executionBackend === b
-                    ? 'bg-blue-600 text-white'
-                    : 'text-gray-400 hover:text-gray-200')
-                }
-              >
-                {b === 'freebuff' ? 'Freebuff' : 'Harness'}
-              </button>
-            ))}
-          </div>
-        </div>
+      {/* Right side — live subscriber liveness (red = messages will time out) */}
+      <div className="flex items-center space-x-2">
+        <SubscriberStatus />
       </div>
     </div>
   );

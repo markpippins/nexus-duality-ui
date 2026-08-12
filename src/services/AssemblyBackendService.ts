@@ -6,6 +6,14 @@ const FORUM_SLUG = 'duality-sessions';
 const POLL_INTERVAL_MS = 3000;
 const ENGINEER_ID = 'af069ff6-760c-44cb-a0d4-11517164169b';
 
+// No-response timeout per execution backend. Harness (opencode /run-direct)
+// sessions typically reply in ~15s, so a failure surfaces after 30s instead
+// of forcing a full 90s wait. Freebuff interactive turns can legitimately
+// take longer — keep the original 90s there.
+const NO_RESPONSE_TIMEOUT_MS: Record<ExecutionBackend, number> = {
+  freebuff: 90_000,    harness: 45_000, // 34s observed for z-ai/glm-5.2 runs + margin
+};
+
 export type ExecutionBackend = 'freebuff' | 'harness';
 
 interface AssemblyComment {
@@ -123,27 +131,34 @@ export class AssemblyBackendService {
 
     // Try server-side session lookup (survives browser clears / iframe reloads)
     try {
+      // Pass the selected backend so the server returns the most recent
+      // session for THIS execution path (freebuff vs harness) instead of
+      // the globally most recent one — the backend-blind lookup previously
+      // returned the wrong session type and caused a silent new-thread
+      // creation, orphaning the real conversation.
       const resp = await fetch(
-        `${ASSEMBLY_URL}/api/duality/watches/active?role=${encodeURIComponent(this.leftRole)}&forumSlug=${encodeURIComponent(FORUM_SLUG)}`
+        `${ASSEMBLY_URL}/api/duality/watches/active?role=${encodeURIComponent(this.leftRole)}&forumSlug=${encodeURIComponent(FORUM_SLUG)}&execution_backend=${encodeURIComponent(this.executionBackend)}`
       );
       if (resp.ok) {
         const data = await resp.json();
         if (data.threadId) {
-          // Only resume if an active watch on that thread uses the currently
-          // selected backend — a freebuff session must not be hijacked into
-          // a harness one (or vice versa). Otherwise fall through and create
-          // a fresh session with the selected backend.
-          const watchMatches = await this.activeWatchMatchesBackend(data.threadId);
-          if (watchMatches) {
-            // Verify thread still exists
-            const threadResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${data.threadId}`);
-            if (threadResp.ok) {
-              if (gen !== this.sessionGen) return ''; // superseded by a switch
-              this.threadId = data.threadId;
-              this.startPolling();
-              await this.loadThreadHistory();
-              return this.threadId;
+          // Verify thread still exists
+          const threadResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${data.threadId}`);
+          if (threadResp.ok) {
+            if (gen !== this.sessionGen) return ''; // superseded by a switch
+            this.threadId = data.threadId;
+            // Resume regardless of watch status — a session closed by the
+            // subscriber (e.g. lease-gate failure) must stay visible with its
+            // error history, or the user's message looks like it vanished.
+            // If the watch is not active (closed/missing), create a fresh
+            // active watch so new turns on this thread are processed.
+            const hasActiveWatch = await this.activeWatchMatchesBackend(data.threadId);
+            if (!hasActiveWatch) {
+              await this.ensureWatch();
             }
+            this.startPolling();
+            await this.loadThreadHistory();
+            return this.threadId;
           }
         }
       }
@@ -245,6 +260,10 @@ export class AssemblyBackendService {
           content: body,
           timestamp,
         });
+        // The error comment IS the response for this turn — the subscriber
+        // already failed fast (e.g. lease gate). Clear the no-response
+        // timer so the user doesn't get a spurious timeout notice on top.
+        this.clearNoResponseTimer();
       }
 
       // Messages from the right-panel role → BuilderStream
@@ -342,12 +361,14 @@ export class AssemblyBackendService {
     );
   }
 
-  /** Arm a no-response timer — if no agent reply arrives within 90s, surface an error. */
+  /** Arm a no-response timer — if no agent reply arrives within the
+   *  backend's timeout (90s freebuff / 30s harness), surface an error. */
   private armNoResponseTimer(): void {
     this.clearNoResponseTimer();
+    const timeoutMs = NO_RESPONSE_TIMEOUT_MS[this.executionBackend];
     this.noResponseTimer = setTimeout(() => {
       void this.surfaceTimeoutDiagnostics();
-    }, 90_000);
+    }, timeoutMs);
   }
 
   /**
@@ -392,10 +413,11 @@ export class AssemblyBackendService {
       }
     }
 
+    const timeoutSec = NO_RESPONSE_TIMEOUT_MS[this.executionBackend] / 1000;
     const sysMsg: ChatMessage = {
       id: 'err-timeout-' + Date.now(),
       role: 'system',
-      content: `⏳  No response from **${this.leftRole}** within 90s. The subscriber daemon may be down or the role lease may be inactive. Check \`systemctl --user status cascade-interactive-turn\`.${detail}`,
+      content: `⏳  No response from **${this.leftRole}** within ${timeoutSec}s. The subscriber daemon may be down or the role lease may be inactive. Check \`systemctl --user status cascade-interactive-turn\`.${detail}`,
       timestamp: new Date(),
     };
     const current = this.architectChatSubject.getValue();
@@ -445,7 +467,8 @@ export class AssemblyBackendService {
         throw new Error(`Failed to post message (HTTP ${postResp.status}): ${errBody.slice(0, 300)}`);
       }
 
-      // 3. Arm timeout — surface error if no response within 90s
+      // 3. Arm timeout — surface error if no response within the backend
+      //    timeout (90s freebuff / 30s harness)
       this.armNoResponseTimer();
 
       // 4. Poll immediately for the response (frontend polling handles
@@ -483,5 +506,15 @@ export class AssemblyBackendService {
   }
 }
 
-// Singleton
-export const BackendService = new AssemblyBackendService();
+// Singleton — persisted on globalThis so Vite HMR re-execution of this module
+// reuses the SAME instance (and the same rxjs subjects). Without this, every
+// hot update of this file creates a fresh BackendService whose subjects nobody
+// is subscribed to: sends still hit the DB, but the chat UI never sees them —
+// messages look 'eaten'. Long-lived dev tabs hit this after any service edit.
+const BACKEND_SERVICE_KEY = '__duality_backend_service__';
+const backendGlobal = globalThis as unknown as {
+  [BACKEND_SERVICE_KEY]?: AssemblyBackendService;
+};
+export const BackendService: AssemblyBackendService =
+  backendGlobal[BACKEND_SERVICE_KEY] ??
+  (backendGlobal[BACKEND_SERVICE_KEY] = new AssemblyBackendService());
