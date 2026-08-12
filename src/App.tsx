@@ -4,6 +4,7 @@ import { ArchitectChat } from './components/ArchitectChat';
 import { BuilderStream } from './components/BuilderStream';
 import { FileTreeSidebar } from './components/FileTreeSidebar';
 import { TopBar } from './components/TopBar';
+import { ExecutionBackend } from './services/AssemblyBackendService';
 const EVENT_BUS_URL = 'http://localhost:3200';
 
 export interface BreadcrumbPart {
@@ -43,6 +44,11 @@ export default function App() {
   const [leftRole, setLeftRole] = useState<string>('analyst');
   const [rightRole, setRightRole] = useState<string>('builder');
 
+  // Execution backend — applies to NEW sessions (freebuff interactive vs
+  // harness-srv opencode). ArchitectChat reacts to changes by re-ensuring the
+  // thread, creating a fresh session with the selected backend.
+  const [executionBackend, setExecutionBackend] = useState<ExecutionBackend>('freebuff');
+
   // Connect to the UI event bus and subscribe to theme changes
   useEffect(() => {
     const es = new EventSource(`${EVENT_BUS_URL}/api/events/stream?sender=duality-ui`);
@@ -66,8 +72,10 @@ export default function App() {
       <TopBar
         leftRole={leftRole}
         rightRole={rightRole}
+        executionBackend={executionBackend}
         onLeftRoleChange={setLeftRole}
         onRightRoleChange={setRightRole}
+        onExecutionBackendChange={setExecutionBackend}
       />
       <div className="flex-1 flex overflow-hidden">
         <WorkspaceSidebar />
@@ -75,7 +83,7 @@ export default function App() {
         <div className="flex-1 flex flex-col overflow-hidden">
           {/* Main IDE Area */}
           <div className="flex-1 flex overflow-hidden">
-            <ArchitectChat role={leftRole} />
+            <ArchitectChat role={leftRole} executionBackend={executionBackend} />
             <BuilderStream role={rightRole} />
           </div>
 

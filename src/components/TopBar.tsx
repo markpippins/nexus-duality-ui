@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Cpu, HardDrive, ChevronRight } from 'lucide-react';
+import { Cpu, HardDrive, ChevronRight, Zap } from 'lucide-react';
+import { ExecutionBackend } from '../services/AssemblyBackendService';
 
 interface BreadcrumbPart {
   label: string;
@@ -17,8 +18,10 @@ interface TopBarProps {
   breadcrumbs?: BreadcrumbPart[];
   leftRole: string;
   rightRole: string;
+  executionBackend: ExecutionBackend;
   onLeftRoleChange: (role: string) => void;
   onRightRoleChange: (role: string) => void;
+  onExecutionBackendChange: (backend: ExecutionBackend) => void;
 }
 
 const TACKLE_SRV = 'http://localhost:3410';
@@ -28,8 +31,10 @@ export function TopBar({
   breadcrumbs = [],
   leftRole,
   rightRole,
+  executionBackend,
   onLeftRoleChange,
   onRightRoleChange,
+  onExecutionBackendChange,
 }: TopBarProps) {
   const [roles, setRoles] = useState<TackleRole[]>([]);
 
@@ -42,16 +47,21 @@ export function TopBar({
         // Auto-select architect/builder if they exist and not already set
         const arch = list.find(r => r.name === 'architect');
         const build = list.find(r => r.name === 'builder');
-        if (arch && !leftRole) onLeftRoleChange(arch.id);
-        if (build && !rightRole) onRightRoleChange(build.id);
+        if (arch && !leftRole) onLeftRoleChange(arch.name);
+        if (build && !rightRole) onRightRoleChange(build.name);
       })
       .catch(() => {
         // Fallback: tackle-srv may not be running; keep defaults
       });
   }, []);
 
-  const leftRoleName = roles.find(r => r.id === leftRole)?.name || 'architect';
-  const rightRoleName = roles.find(r => r.id === rightRole)?.name || 'builder';
+  // Select values are role NAMES (not the tackle.roles UUID id): the whole
+  // backend — tackle.config_bundle, role_leases, harness-srv, and the turn
+  // subscriber — keys on the role name. Using r.id here made harness runs
+  // fail with 'no active config_bundle found for <uuid>'. Display names are
+  // therefore just the values themselves with a fallback.
+  const leftRoleName = leftRole || 'architect';
+  const rightRoleName = rightRole || 'builder';
 
   return (
     <div className="h-14 border-b border-gray-800 bg-gray-900 flex items-center justify-between px-4 text-sm text-gray-300 shrink-0">
@@ -97,7 +107,7 @@ export function TopBar({
               <option value={leftRole}>{leftRoleName}</option>
             )}
             {roles.map(r => (
-              <option key={r.id} value={r.id}>{r.name}</option>
+              <option key={r.id} value={r.name}>{r.name}</option>
             ))}
           </select>
           <span className="text-[10px] text-gray-500 font-mono uppercase px-1.5 py-0.5 rounded bg-gray-700/50">
@@ -119,12 +129,39 @@ export function TopBar({
               <option value={rightRole}>{rightRoleName}</option>
             )}
             {roles.map(r => (
-              <option key={r.id} value={r.id}>{r.name}</option>
+              <option key={r.id} value={r.name}>{r.name}</option>
             ))}
           </select>
           <span className="text-[10px] text-gray-500 font-mono uppercase px-1.5 py-0.5 rounded bg-gray-700/50">
             {rightRoleName}
           </span>
+        </div>
+
+        {/* Execution Backend Selector — applies to NEW sessions */}
+        <div
+          className="flex items-center space-x-2"
+          title={
+            'Execution backend for new sessions: Freebuff = interactive turn ' +
+            '(session owns context); Harness = ephemeral opencode run via harness-srv'
+          }
+        >
+          <Zap className="w-4 h-4 text-amber-400" />
+          <div className="flex bg-gray-800 rounded-md border border-gray-700 p-0.5">
+            {(['freebuff', 'harness'] as const).map(b => (
+              <button
+                key={b}
+                onClick={() => onExecutionBackendChange(b)}
+                className={
+                  'px-2.5 py-1 text-xs font-medium rounded transition-colors ' +
+                  (executionBackend === b
+                    ? 'bg-blue-600 text-white'
+                    : 'text-gray-400 hover:text-gray-200')
+                }
+              >
+                {b === 'freebuff' ? 'Freebuff' : 'Harness'}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
     </div>

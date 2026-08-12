@@ -1,30 +1,29 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useSimulation } from '../hooks/useSimulation';
-import { Send, User, Cpu } from 'lucide-react';
+import { Send, User, Cpu, AlertTriangle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
+import { ExecutionBackend } from '../services/AssemblyBackendService';
 
 interface ArchitectChatProps {
   role: string;
   rightRole?: string;
+  executionBackend?: ExecutionBackend;
 }
 
-export function ArchitectChat({ role, rightRole = 'builder' }: ArchitectChatProps) {
+export function ArchitectChat({ role, rightRole = 'builder', executionBackend = 'freebuff' }: ArchitectChatProps) {
   const { architectChat, BackendService } = useSimulation();
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Set roles and load session on mount (even if default role is already selected)
+  // Configure roles + execution backend and load the session. Re-runs on
+  // mount, on role switch (new role → new thread), and on backend switch
+  // (new backend → fresh session with the selected execution path).
   useEffect(() => {
+    BackendService.setExecutionBackend(executionBackend);
     BackendService.setRoles(role, rightRole);
     BackendService.ensureThread().catch(() => {});
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // When roles change (user switches dropdown), reset thread and re-query
-  useEffect(() => {
-    BackendService.setRoles(role, rightRole);
-    BackendService.ensureThread().catch(() => {});
-  }, [role, rightRole]);
+  }, [role, rightRole, executionBackend]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -63,14 +62,14 @@ export function ArchitectChat({ role, rightRole = 'builder' }: ArchitectChatProp
             >
               <div className={cn(
                 "w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1",
-                msg.role === 'user' ? "bg-blue-600" : "bg-purple-600"
+                msg.role === 'user' ? "bg-blue-600" : msg.role === 'system' ? "bg-amber-600" : "bg-purple-600"
               )}>
-                {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : <Cpu className="w-4 h-4 text-white" />}
+                {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : msg.role === 'system' ? <AlertTriangle className="w-4 h-4 text-white" /> : <Cpu className="w-4 h-4 text-white" />}
               </div>
 
               <div className={cn(
                 "rounded-lg p-3 text-sm",
-                msg.role === 'user' ? "bg-blue-600/20 text-blue-50" : "bg-gray-800 text-gray-200 border border-gray-700"
+                msg.role === 'user' ? "bg-blue-600/20 text-blue-50" : msg.role === 'system' ? "bg-amber-950/60 border border-amber-700/60 text-amber-200" : "bg-gray-800 text-gray-200 border border-gray-700"
               )}>
                 <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
                 {msg.isStreaming && <span className="inline-block w-2 h-4 bg-gray-400 ml-1 animate-pulse align-middle" />}
