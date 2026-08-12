@@ -11,7 +11,7 @@ const ENGINEER_ID = 'af069ff6-760c-44cb-a0d4-11517164169b';
 // of forcing a full 90s wait. Freebuff interactive turns can legitimately
 // take longer — keep the original 90s there.
 const NO_RESPONSE_TIMEOUT_MS: Record<ExecutionBackend, number> = {
-  freebuff: 90_000,    harness: 45_000, // 34s observed for z-ai/glm-5.2 runs + margin
+  freebuff: 90_000,    harness: 120_000, // harness-srv now reports timeouts honestly (exit 124) — this timer is only a "slow" notice, not the failure signal
 };
 
 export type ExecutionBackend = 'freebuff' | 'harness';

@@ -73,7 +73,7 @@ export function PanelControls({
       >
         <Zap className="w-3.5 h-3.5 text-amber-400" />
         <div className="flex bg-gray-800 rounded-md border border-gray-700 p-0.5">
-          {(['freebuff', 'harness'] as const).map(b => (
+          {(['harness', 'freebuff'] as const).map(b => (
             <button
               key={b}
               onClick={() => onExecutionBackendChange(b)}
