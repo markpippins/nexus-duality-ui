@@ -121,6 +121,65 @@ fetchLog = [];
 }
 fetchLog = [];
 
+// ── 8a. turn envelope: poll fetches latest turn state + reconciles ────────
+{
+  const svc = fresh();
+  responses.push({ status: 200, body: JSON.stringify({ threadId: 't-turn' }) });
+  responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // verify
+  responses.push({ status: 200, body: JSON.stringify([]) });                // activeWatchMatchesBackend
+  responses.push({ status: 201, body: JSON.stringify({ id: 'w-turn' }) });  // watch
+  responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // history
+  responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // first poll
+  responses.push({ status: 200, body: JSON.stringify({
+    turn: {
+      id: 'turn-1', thread_id: 't-turn', role: 'builder',
+      execution_backend: 'harness', state: 'running',
+      request_comment_id: null, response_comment_id: null,
+      subscriber_id: 'cascade-interactive-turn', job_id: 'job-abc',
+      execution_plan_version: null, failure_detail: null,
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      accepted_at: null, running_at: null, completed_at: null,
+      failed_at: null, timed_out_at: null, cancelled_at: null,
+    },
+  }) }); // turn state fetch
+  await svc.ensureThread();
+  let turns = [];
+  svc.turnState$.subscribe(t => { turns = t ? [t] : []; });
+  await svc.pollThread();
+  check('poll fetches latest turn envelope', turns.length === 1 && turns[0].state === 'running', JSON.stringify(turns));
+}
+fetchLog = [];
+
+// ── 8b. terminal turn envelope clears the in-flight indicator ─────────────
+{
+  const svc = fresh();
+  responses.push({ status: 200, body: JSON.stringify({ threadId: 't-done' }) });
+  responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // verify
+  responses.push({ status: 200, body: JSON.stringify([]) });                // activeWatchMatchesBackend
+  responses.push({ status: 201, body: JSON.stringify({ id: 'w-done' }) });  // watch
+  responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // history
+  responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // poll
+  responses.push({ status: 200, body: JSON.stringify({
+    turn: {
+      id: 'turn-2', thread_id: 't-done', role: 'builder',
+      execution_backend: 'harness', state: 'timed_out',
+      request_comment_id: null, response_comment_id: null,
+      subscriber_id: 'cascade-interactive-turn', job_id: 'job-xyz',
+      execution_plan_version: null, failure_detail: 'timeout after 600000ms',
+      created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      accepted_at: null, running_at: null, completed_at: null,
+      failed_at: null, timed_out_at: null, cancelled_at: null,
+    },
+  }) }); // turn state fetch
+  await svc.ensureThread();
+  svc.agentWorkingSubject?.next?.(true); // simulate in-flight
+  let turns = [];
+  svc.turnState$.subscribe(t => { turns = t ? [t] : []; });
+  await svc.pollThread();
+  check('terminal turn fetched', turns.length === 1 && turns[0].state === 'timed_out');
+}
+fetchLog = [];
+
 // ── 8. poll failure streak: 2 consecutive failures → visible message ──────
 {
   const svc = fresh();

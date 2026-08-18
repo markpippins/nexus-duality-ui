@@ -3,7 +3,7 @@ import { useSimulation } from '../hooks/useSimulation';
 import { Send, User, Cpu, AlertTriangle, Info, Brain, ChevronDown, ChevronRight } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
-import { ExecutionBackend } from '../services/AssemblyBackendService';
+import { ExecutionBackend, TurnState } from '../services/AssemblyBackendService';
 import { PanelControls, TackleRole } from './PanelControls';
 
 interface ArchitectChatProps {
@@ -74,6 +74,7 @@ export function ArchitectChat({
   const { architectChat, BackendService } = useSimulation();
   const [input, setInput] = useState('');
   const [agentWorking, setAgentWorking] = useState(false);
+  const [turnState, setTurnState] = useState<TurnState | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // In-flight turn indicator — the roadmap's isStreaming flag was never set
@@ -82,6 +83,14 @@ export function ArchitectChat({
   // that the agent is working).
   useEffect(() => {
     const sub = BackendService.agentWorking$.subscribe(setAgentWorking);
+    return () => sub.unsubscribe();
+  }, [BackendService]);
+
+  // Server-side turn envelope (P0-1 item 3) — the authoritative lifecycle.
+  // Rendered as a status line under the working cursor when a turn is in
+  // flight, and as the failure detail when a turn failed/timed out.
+  useEffect(() => {
+    const sub = BackendService.turnState$.subscribe(setTurnState);
     return () => sub.unsubscribe();
   }, [BackendService]);
 
@@ -192,6 +201,28 @@ export function ArchitectChat({
           <div className="flex items-center space-x-2 text-xs text-gray-500 animate-pulse">
             <span className="inline-block w-2 h-4 bg-emerald-400" />
             <span>{roleDisplayName} is working…</span>
+            {turnState && (turnState.state === 'accepted' || turnState.state === 'running') && (
+              <span className="text-[10px] uppercase tracking-widest text-gray-600">
+                {turnState.state === 'accepted' ? 'queued' : 'running'}
+                {turnState.job_id ? ` · job ${turnState.job_id.slice(0, 8)}` : ''}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Terminal turn failure — server-side envelope detail (P0-1 item 3) */}
+        {!agentWorking && turnState && (turnState.state === 'failed' || turnState.state === 'timed_out' || turnState.state === 'cancelled') && (
+          <div className="flex items-start space-x-2 text-xs text-amber-400/90 border border-amber-700/40 bg-amber-950/30 rounded-md px-3 py-2">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="font-semibold uppercase tracking-widest text-[10px]">
+                Turn {turnState.state.replace('_', ' ')}
+                {turnState.job_id ? ` · job ${turnState.job_id.slice(0, 8)}` : ''}
+              </p>
+              {turnState.failure_detail && (
+                <p className="whitespace-pre-wrap leading-relaxed mt-0.5">{turnState.failure_detail}</p>
+              )}
+            </div>
           </div>
         )}
 

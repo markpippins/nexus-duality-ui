@@ -48,6 +48,31 @@ interface AssemblyThread {
   comments: AssemblyComment[];
 }
 
+/** Server-side turn/job state envelope (duality.session_turns, V112).
+ *  The UI renders this instead of inferring turn lifecycle from comment
+ *  count — the Analyst P0-1 item 3 contract. */
+export interface TurnState {
+  id: string;
+  thread_id: string;
+  role: string;
+  execution_backend: 'operator' | 'harness' | 'freebuff';
+  state: 'accepted' | 'running' | 'completed' | 'failed' | 'timed_out' | 'cancelled';
+  request_comment_id: string | null;
+  response_comment_id: string | null;
+  subscriber_id: string | null;
+  job_id: string | null;
+  execution_plan_version: string | null;
+  failure_detail: string | null;
+  created_at: string;
+  updated_at: string;
+  accepted_at: string | null;
+  running_at: string | null;
+  completed_at: string | null;
+  failed_at: string | null;
+  timed_out_at: string | null;
+  cancelled_at: string | null;
+}
+
 /** A past session thread, as listed by the session picker. */
 export interface SessionSummary {
   id: string;
@@ -73,6 +98,12 @@ export class AssemblyBackendService {
   private agentWorkingSubject = new BehaviorSubject<boolean>(false);
   public agentWorking$ = this.agentWorkingSubject.asObservable();
 
+  /** Latest server-side turn envelope for the current thread (null = none
+   *  yet). Drives the working indicator + status line from the subscriber's
+   *  authoritative lifecycle instead of comment-count inference. */
+  private turnStateSubject = new BehaviorSubject<TurnState | null>(null);
+  public turnState$ = this.turnStateSubject.asObservable();
+
   // Legacy streams (kept for interface compatibility, not used for chat)
   private workspacesSubject = new BehaviorSubject<Workspace[]>([]);
   public workspaces$ = this.workspacesSubject.asObservable();
@@ -97,6 +128,10 @@ export class AssemblyBackendService {
   private isSubmitting = false;
   private watchCreated = false;
   private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Epoch ms of the most recent send — terminal turn envelopes older than
+   *  this are the PREVIOUS turn, so they must not clear the in-flight
+   *  indicator before the subscriber creates the new turn. */
+  private lastSendAt = 0;
 
   /** Configure which roles the left and right panels represent.
    *  Resets session state so ensureThread re-queries for the new role's active watch. */
@@ -108,6 +143,7 @@ export class AssemblyBackendService {
     this.threadId = null;
     this.currentThreadSubject.next(null);
     this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
     this.watchCreated = false;
     this.lastCommentCount = 0;
     this.sessionGen++;
@@ -137,6 +173,7 @@ export class AssemblyBackendService {
     this.threadId = null;
     this.currentThreadSubject.next(null);
     this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
     this.watchCreated = false;
     this.lastCommentCount = 0;
     this.sessionGen++;
@@ -188,6 +225,7 @@ export class AssemblyBackendService {
     this.threadId = threadId;
     this.currentThreadSubject.next(threadId);
     this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
     this.watchCreated = false;
     this.lastCommentCount = 0;
     this.sessionGen++;
@@ -209,6 +247,7 @@ export class AssemblyBackendService {
     this.threadId = null;
     this.currentThreadSubject.next(null);
     this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
     this.watchCreated = false;
     this.lastCommentCount = 0;
     this.sessionGen++;
@@ -384,8 +423,44 @@ export class AssemblyBackendService {
         this.lastCommentCount = comments.length;
         this.syncCommentsToState(comments);
       }
+      // Pull the latest server-side turn envelope — the authoritative
+      // lifecycle (accepted → running → completed/failed/timed_out). This
+      // replaces comment-count inference for the working indicator.
+      await this.refreshTurnState();
     } catch {
       this.notePollFailure(corr, 'network error');
+    }
+  }
+
+  /** Fetch the latest turn envelope for the current thread and reconcile
+   *  the working indicator + no-response timer against it. Best-effort: a
+   *  failed turn fetch never breaks the comment poll. */
+  private async refreshTurnState(): Promise<void> {
+    if (!this.threadId) return;
+    try {
+      const resp = await fetch(
+        `${ASSEMBLY_URL}/api/duality/turns/latest?threadId=${encodeURIComponent(this.threadId)}`,
+        { headers: { 'X-Request-Id': nextCorrelationId() } }
+      );
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const turn: TurnState | null = data?.turn ?? null;
+      this.turnStateSubject.next(turn);
+      if (!turn) return;
+      // Reconcile the in-flight indicator: accepted/running = working;
+      // any terminal state = not working. A terminal envelope that is
+      // OLDER than the most recent send is the previous turn — ignore it
+      // so the working indicator doesn't clear before the subscriber
+      // creates the new turn's envelope.
+      const turnTime = Date.parse(turn.updated_at || turn.created_at) || 0;
+      if (turnTime < this.lastSendAt) return;
+      const inFlight = turn.state === 'accepted' || turn.state === 'running';
+      if (!inFlight) {
+        this.agentWorkingSubject.next(false);
+        this.clearNoResponseTimer();
+      }
+    } catch {
+      // best-effort — comment polling is the resilient path
     }
   }
 
@@ -645,7 +720,11 @@ export class AssemblyBackendService {
     try {
       const tid = await this.ensureThread();
 
-      // 1. Add user message locally (optimistic)
+      // 0. Mark the send time + drop any stale turn envelope so the UI
+      //    doesn't render the previous turn's terminal state while the new
+      //    turn is being accepted server-side.
+      this.lastSendAt = Date.now();
+      this.turnStateSubject.next(null);
       const userMsg: ChatMessage = {
         id: 'user-' + Date.now(),
         role: 'user',
