@@ -976,10 +976,15 @@ export class AssemblyBackendService {
       const current = this.architectChatSubject.getValue();
       this.architectChatSubject.next([...current, userMsg]);
 
-      // 2. Post as Assembly comment — CHECK the response. A failed post
-      //    (e.g. subscriber/forum down, thread closed) must reach the user
-      //    immediately, not silently wait out the 90s timeout.
-      const postResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${tid}/comments`, {
+      // 2. Post the message EVENT-FIRST via the durable session-event stream
+      //    (P2 item 9): POST /api/duality/sessions/:id/messages writes the
+      //    comment.created envelope (the source) and projects the Assembly
+      //    comment (the render) in one transaction, so the subscriber
+      //    dispatches from the event stream — Assembly comments are no longer
+      //    the transport. CHECK the response: a failed post (subscriber/forum
+      //    down, thread closed) must reach the user immediately, not silently
+      //    wait out the timeout.
+      const postResp = await fetch(`${ASSEMBLY_URL}/api/duality/sessions/${tid}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Request-Id': nextCorrelationId() },
         body: JSON.stringify({
