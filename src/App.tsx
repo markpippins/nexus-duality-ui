@@ -81,18 +81,20 @@ export default function App() {
   const [roles, setRoles] = useState<TackleRole[]>([]);
 
   // Execution mode — per panel, applies to NEW sessions for that panel's
-  // agent. Leased = interactive polling-loop agent (needs an ACTIVE role
-  // lease); Harness = cloud executor (opencode/codex/gemini, no lease). The
-  // left panel reacts to changes by re-ensuring the thread, creating a fresh
-  // session with the selected mode. Restored from localStorage so the boot
-  // backend matches the existing session (the resume lookup filters on it).
+  // agent. Operator = direct operator-svc /chat call (the nexus-console
+  // messagebox mechanism — persistent provider session, no lease); Leased =
+  // interactive polling-loop agent (needs an ACTIVE role lease); Harness =
+  // cloud executor (opencode/codex/gemini, no lease). The left panel reacts
+  // to changes by re-ensuring the thread, creating a fresh session with the
+  // selected mode. Restored from localStorage so the boot backend matches
+  // the existing session (the resume lookup filters on it).
   const [leftBackend, setLeftBackend] = useState<ExecutionBackend>(() => {
-    const b = loadPersisted<ExecutionBackend>(LS_KEYS.leftBackend, 'harness');
-    return b === 'freebuff' || b === 'harness' ? b : 'harness';
+    const b = loadPersisted<ExecutionBackend>(LS_KEYS.leftBackend, 'operator');
+    return b === 'operator' || b === 'freebuff' || b === 'harness' ? b : 'operator';
   });
   const [rightBackend, setRightBackend] = useState<ExecutionBackend>(() => {
-    const b = loadPersisted<ExecutionBackend>(LS_KEYS.rightBackend, 'harness');
-    return b === 'freebuff' || b === 'harness' ? b : 'harness';
+    const b = loadPersisted<ExecutionBackend>(LS_KEYS.rightBackend, 'operator');
+    return b === 'operator' || b === 'freebuff' || b === 'harness' ? b : 'operator';
   });
 
   // Persist panel state on change — this is what lets a cold boot (iframe

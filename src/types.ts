@@ -19,7 +19,7 @@ export interface FileNode {
   isOpen?: boolean;
 }
 
-export type Role = 'user' | 'architect' | 'builder' | 'system';
+export type Role = 'user' | 'architect' | 'builder' | 'system' | 'thinking';
 
 export interface ChatMessage {
   id: string;
@@ -31,7 +31,8 @@ export interface ChatMessage {
 
 export interface AgentLog {
   id: string;
-  agent: 'architect' | 'builder';
+  /** Role name of the producing agent (any tackle role). */
+  agent: string;
   action: string;
   details: string;
   status: 'pending' | 'success' | 'error';

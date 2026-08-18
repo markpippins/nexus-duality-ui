@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useSimulation } from '../hooks/useSimulation';
-import { Send, User, Cpu, AlertTriangle, Info } from 'lucide-react';
+import { Send, User, Cpu, AlertTriangle, Info, Brain, ChevronDown, ChevronRight } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { ExecutionBackend } from '../services/AssemblyBackendService';
@@ -73,7 +73,17 @@ export function ArchitectChat({
 }: ArchitectChatProps) {
   const { architectChat, BackendService } = useSimulation();
   const [input, setInput] = useState('');
+  const [agentWorking, setAgentWorking] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // In-flight turn indicator — the roadmap's isStreaming flag was never set
+  // in real mode; this drives the same blinking cursor while a turn is
+  // awaiting its agent reply (no fabricated tokens — the cursor simply marks
+  // that the agent is working).
+  useEffect(() => {
+    const sub = BackendService.agentWorking$.subscribe(setAgentWorking);
+    return () => sub.unsubscribe();
+  }, [BackendService]);
 
   // Configure roles + execution backend and load the session. Re-runs on
   // mount, on role switch (new role → new thread), and on backend switch
@@ -86,7 +96,7 @@ export function ArchitectChat({
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [architectChat]);
+  }, [architectChat, agentWorking]);
 
   // ── Pre-send role-lease warning (non-engineer roles) ───────────────
   // Non-engineer roles run on the z-ai/glm-5.2 lease model via the
@@ -153,23 +163,38 @@ export function ArchitectChat({
                 msg.role === 'user' ? "ml-auto flex-row-reverse space-x-reverse" : "mr-auto"
               )}
             >
-              <div className={cn(
-                "w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1",
-                msg.role === 'user' ? "bg-blue-600" : msg.role === 'system' ? "bg-amber-600" : "bg-purple-600"
-              )}>
-                {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : msg.role === 'system' ? <AlertTriangle className="w-4 h-4 text-white" /> : <Cpu className="w-4 h-4 text-white" />}
-              </div>
+              {msg.role === 'thinking' ? (
+                <ThinkingTrace content={msg.content} />
+              ) : (
+                <>
+                  <div className={cn(
+                    "w-8 h-8 rounded-full flex items-center justify-center shrink-0 mt-1",
+                    msg.role === 'user' ? "bg-blue-600" : msg.role === 'system' ? "bg-amber-600" : "bg-purple-600"
+                  )}>
+                    {msg.role === 'user' ? <User className="w-4 h-4 text-white" /> : msg.role === 'system' ? <AlertTriangle className="w-4 h-4 text-white" /> : <Cpu className="w-4 h-4 text-white" />}
+                  </div>
 
-              <div className={cn(
-                "rounded-lg p-3 text-sm",
-                msg.role === 'user' ? "bg-blue-600/20 text-blue-50" : msg.role === 'system' ? "bg-amber-950/60 border border-amber-700/60 text-amber-200" : "bg-gray-800 text-gray-200 border border-gray-700"
-              )}>
-                <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
-                {msg.isStreaming && <span className="inline-block w-2 h-4 bg-gray-400 ml-1 animate-pulse align-middle" />}
-              </div>
+                  <div className={cn(
+                    "rounded-lg p-3 text-sm",
+                    msg.role === 'user' ? "bg-blue-600/20 text-blue-50" : msg.role === 'system' ? "bg-amber-950/60 border border-amber-700/60 text-amber-200" : "bg-gray-800 text-gray-200 border border-gray-700"
+                  )}>
+                    <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                    {msg.isStreaming && <span className="inline-block w-2 h-4 bg-gray-400 ml-1 animate-pulse align-middle" />}
+                  </div>
+                </>
+              )}
             </motion.div>
           ))}
         </AnimatePresence>
+
+        {/* Agent is working — streaming cursor (in-flight turn indicator) */}
+        {agentWorking && (
+          <div className="flex items-center space-x-2 text-xs text-gray-500 animate-pulse">
+            <span className="inline-block w-2 h-4 bg-emerald-400" />
+            <span>{roleDisplayName} is working…</span>
+          </div>
+        )}
+
         <div ref={bottomRef} />
       </div>
 
@@ -199,6 +224,32 @@ export function ArchitectChat({
           </button>
         </form>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Collapsible "agent thinking" trace — the reasoning the harness agent
+ * produced before its answer (posted by the subscriber as a role=thinking
+ * comment). Rendered Freebuff-style: a muted header, collapsed by default.
+ */
+function ThinkingTrace({ content }: { content: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="w-full min-w-0">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="flex items-center space-x-2 text-[11px] text-gray-500 hover:text-gray-300 transition-colors select-none"
+      >
+        {open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        <Brain className="w-3.5 h-3.5" />
+        <span className="uppercase tracking-widest">Thinking</span>
+      </button>
+      {open && (
+        <div className="mt-1.5 border-l-2 border-gray-700 pl-3 py-0.5 text-xs text-gray-500 italic whitespace-pre-wrap leading-relaxed max-h-72 overflow-y-auto">
+          {content}
+        </div>
+      )}
     </div>
   );
 }

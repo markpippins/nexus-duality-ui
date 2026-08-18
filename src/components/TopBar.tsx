@@ -1,6 +1,7 @@
 import React from 'react';
 import { ChevronRight } from 'lucide-react';
 import { SubscriberStatus } from './SubscriberStatus';
+import { SessionPicker } from './SessionPicker';
 
 interface BreadcrumbPart {
   label: string;
@@ -47,8 +48,9 @@ export function TopBar({ breadcrumbs = [] }: TopBarProps) {
         )}
       </div>
 
-      {/* Right side — live subscriber liveness (red = messages will time out) */}
+      {/* Right side — session history picker + live subscriber liveness (red = messages will time out) */}
       <div className="flex items-center space-x-2">
+        <SessionPicker />
         <SubscriberStatus />
       </div>
     </div>

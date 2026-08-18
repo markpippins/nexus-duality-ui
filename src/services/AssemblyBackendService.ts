@@ -6,15 +6,31 @@ const FORUM_SLUG = 'duality-sessions';
 const POLL_INTERVAL_MS = 3000;
 const ENGINEER_ID = 'af069ff6-760c-44cb-a0d4-11517164169b';
 
+/** Short per-request correlation id — attached as X-Request-Id and surfaced
+ *  in user-visible error messages so a failure can be traced to assembly-srv
+ *  request logs (Analyst P0-1: "Add request correlation IDs"). */
+function nextCorrelationId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Thrown by doEnsureThread when assembly-srv is unreachable/failing during
+ *  session lookup. The visible system message was already pushed by the
+ *  service; callers skip their own generic error to avoid double-reporting. */
+class SessionLookupUnavailableError extends Error {}
+
 // No-response timeout per execution backend. Harness (opencode /run-direct)
 // sessions typically reply in ~15s, so a failure surfaces after 30s instead
 // of forcing a full 90s wait. Freebuff interactive turns can legitimately
-// take longer — keep the original 90s there.
+// take longer — keep the original 90s there. Operator (operator-svc /chat)
+// is a synchronous inference call like nexus-console's messagebox; the
+// subscriber allows 300s there, so the notice timer mirrors that.
 const NO_RESPONSE_TIMEOUT_MS: Record<ExecutionBackend, number> = {
-  freebuff: 90_000,    harness: 120_000, // harness-srv now reports timeouts honestly (exit 124) — this timer is only a "slow" notice, not the failure signal
+  operator: 300_000,
+  freebuff: 90_000,
+  harness: 120_000, // harness-srv now reports timeouts honestly (exit 124) — this timer is only a "slow" notice, not the failure signal
 };
 
-export type ExecutionBackend = 'freebuff' | 'harness';
+export type ExecutionBackend = 'operator' | 'freebuff' | 'harness';
 
 interface AssemblyComment {
   id: string;
@@ -32,6 +48,15 @@ interface AssemblyThread {
   comments: AssemblyComment[];
 }
 
+/** A past session thread, as listed by the session picker. */
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  lastReplyAt: string | null;
+  replyCount: number;
+}
+
 export class AssemblyBackendService {
   // Streams — same interface as SimulatedBackendService
   private architectChatSubject = new BehaviorSubject<ChatMessage[]>([]);
@@ -39,6 +64,14 @@ export class AssemblyBackendService {
 
   private builderLogsSubject = new BehaviorSubject<AgentLog[]>([]);
   public builderLogs$ = this.builderLogsSubject.asObservable();
+
+  /**
+   * True while a turn is in flight (user message posted, agent reply not yet
+   * arrived). Drives the streaming cursor / "working" indicator in both
+   * panels — the roadmap's isStreaming flag was never set in real mode.
+   */
+  private agentWorkingSubject = new BehaviorSubject<boolean>(false);
+  public agentWorking$ = this.agentWorkingSubject.asObservable();
 
   // Legacy streams (kept for interface compatibility, not used for chat)
   private workspacesSubject = new BehaviorSubject<Workspace[]>([]);
@@ -50,6 +83,9 @@ export class AssemblyBackendService {
 
   // Session state
   private threadId: string | null = null;
+  /** Observable of the currently-loaded thread (null = none yet). */
+  private currentThreadSubject = new BehaviorSubject<string | null>(null);
+  public currentThreadId$ = this.currentThreadSubject.asObservable();
   private leftRole: string = 'architect';
   private rightRole: string = 'builder';
   // Execution backend for NEW sessions — 'freebuff' = interactive turn
@@ -70,6 +106,8 @@ export class AssemblyBackendService {
     this.rightRole = right;
     // Reset so ensureThread() re-queries the server for the new role's watch
     this.threadId = null;
+    this.currentThreadSubject.next(null);
+    this.agentWorkingSubject.next(false);
     this.watchCreated = false;
     this.lastCommentCount = 0;
     this.sessionGen++;
@@ -97,6 +135,8 @@ export class AssemblyBackendService {
     if (this.executionBackend === backend) return;
     this.executionBackend = backend;
     this.threadId = null;
+    this.currentThreadSubject.next(null);
+    this.agentWorkingSubject.next(false);
     this.watchCreated = false;
     this.lastCommentCount = 0;
     this.sessionGen++;
@@ -111,6 +151,71 @@ export class AssemblyBackendService {
   // Bumped on every role/backend switch; doEnsureThread discards its result
   // if superseded mid-create (prevents committing a stale session).
   private sessionGen = 0;
+
+  /** List past duality-sessions threads (newest first) for the session picker.
+   *  Throws on transport/HTTP failure so the picker can distinguish "no
+   *  sessions" from "can't reach assembly-srv" (P0-1). */
+  async listSessions(): Promise<SessionSummary[]> {
+    const corr = nextCorrelationId();
+    const resp = await fetch(`${ASSEMBLY_URL}/api/forums/${FORUM_SLUG}/threads`, {
+      headers: { 'X-Request-Id': corr },
+    });
+    if (!resp.ok) {
+      const errBody = (await resp.text().catch(() => '')) || resp.statusText;
+      throw new Error(`Failed to list sessions (HTTP ${resp.status}): ${errBody.slice(0, 200)} [${corr}]`);
+    }
+    const data = await resp.json();
+    const items = Array.isArray(data) ? data : (data.threads || data.items || []);
+    return items.map((t: Record<string, unknown>) => ({
+      id: String(t.id),
+      title: String(t.title || 'Untitled session'),
+      createdAt: String(t.createdAt || ''),
+      lastReplyAt: t.lastReplyAt ? String(t.lastReplyAt) : null,
+      replyCount: Number(t.replyCount || 0),
+    }));
+  }
+
+  /**
+   * Switch the UI to an existing session thread (session picker). Loads its
+   * history, (re)activates a watch so new turns are processed, and polls it.
+   */
+  async loadThread(threadId: string): Promise<void> {
+    this.clearNoResponseTimer();
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.threadId = threadId;
+    this.currentThreadSubject.next(threadId);
+    this.agentWorkingSubject.next(false);
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    this.sessionGen++;
+    await this.loadThreadHistory();
+    await this.ensureWatch();
+    this.startPolling();
+  }
+
+  /**
+   * Start a brand-new session: forget the current thread and create a fresh
+   * one for the current role/backend on the next ensureThread() call.
+   */
+  startNewSession(): void {
+    this.clearNoResponseTimer();
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.threadId = null;
+    this.currentThreadSubject.next(null);
+    this.agentWorkingSubject.next(false);
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    this.sessionGen++;
+    // Fire-and-forget: the panels re-render via architectChat$ once the new
+    // thread exists and its history is loaded.
+    void this.ensureThread().catch(() => {});
+  }
 
   /** Create or resume a session thread. Returns the thread ID.
    *  Public so ArchitectChat can call it on mount for immediate session load.
@@ -129,7 +234,14 @@ export class AssemblyBackendService {
     if (this.threadId) return this.threadId;
     const gen = this.sessionGen;
 
-    // Try server-side session lookup (survives browser clears / iframe reloads)
+    // Try server-side session lookup (survives browser clears / iframe reloads).
+    // P0-1: a 5xx/timeout/network failure here must NOT fall through to
+    // creating a new thread — that is how orphan duplicate sessions are born
+    // (the real conversation exists server-side but the UI can't see it).
+    // Only a definitive "no active watch" (200 with no threadId, or a 404)
+    // legitimately proceeds to creation.
+    const corr = nextCorrelationId();
+    let lookupUnavailable = false;
     try {
       // Pass the selected backend so the server returns the most recent
       // session for THIS execution path (freebuff vs harness) instead of
@@ -137,16 +249,20 @@ export class AssemblyBackendService {
       // returned the wrong session type and caused a silent new-thread
       // creation, orphaning the real conversation.
       const resp = await fetch(
-        `${ASSEMBLY_URL}/api/duality/watches/active?role=${encodeURIComponent(this.leftRole)}&forumSlug=${encodeURIComponent(FORUM_SLUG)}&execution_backend=${encodeURIComponent(this.executionBackend)}`
+        `${ASSEMBLY_URL}/api/duality/watches/active?role=${encodeURIComponent(this.leftRole)}&forumSlug=${encodeURIComponent(FORUM_SLUG)}&execution_backend=${encodeURIComponent(this.executionBackend)}`,
+        { headers: { 'X-Request-Id': corr } }
       );
       if (resp.ok) {
         const data = await resp.json();
         if (data.threadId) {
           // Verify thread still exists
-          const threadResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${data.threadId}`);
+          const threadResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${data.threadId}`, {
+            headers: { 'X-Request-Id': corr },
+          });
           if (threadResp.ok) {
             if (gen !== this.sessionGen) return ''; // superseded by a switch
             this.threadId = data.threadId;
+            this.currentThreadSubject.next(data.threadId);
             // Resume regardless of watch status — a session closed by the
             // subscriber (e.g. lease-gate failure) must stay visible with its
             // error history, or the user's message looks like it vanished.
@@ -160,10 +276,35 @@ export class AssemblyBackendService {
             await this.loadThreadHistory();
             return this.threadId;
           }
+          if (threadResp.status !== 404) {
+            // 5xx/timeout — the thread may still exist; do NOT create a new one.
+            lookupUnavailable = true;
+          }
+          // 404 → the old thread is really gone — proceed to create.
         }
+      } else if (resp.status !== 404) {
+        lookupUnavailable = true;
       }
     } catch {
-      // Server lookup failed — fall through to create new thread
+      lookupUnavailable = true;
+    }
+
+    if (lookupUnavailable) {
+      // assembly-srv is down or failing — creating a new thread here would
+      // orphan the real conversation into a duplicate empty session. Surface
+      // the transport failure visibly; the next send re-attempts the lookup.
+      const sysMsg: ChatMessage = {
+        id: 'err-lookup-' + Date.now(),
+        role: 'system',
+        content: `⚠️  Could not reach assembly-srv to resume this session — not creating a duplicate. The next message will retry. (${corr})`,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, sysMsg]);
+      this.agentWorkingSubject.next(false);
+      throw new SessionLookupUnavailableError(
+        `Session lookup failed — assembly-srv unreachable [${corr}]`
+      );
     }
 
     // Create new thread — tag the title with the backend so sessions are
@@ -172,7 +313,7 @@ export class AssemblyBackendService {
     const title = `Session — ${this.leftRole} + ${this.rightRole} (${backendTag}) — ${new Date().toLocaleString()}`;
     const resp = await fetch(`${ASSEMBLY_URL}/api/forums/duality-sessions/threads`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Request-Id': corr },
       body: JSON.stringify({
         title,
         body: `Interactive session: **${this.leftRole}** (left panel) ↔ **${this.rightRole}** (right panel). Backend: **${backendTag}**.`,
@@ -181,10 +322,14 @@ export class AssemblyBackendService {
         model: 'freebuff/deepseek-v4-flash',
       }),
     });
-    if (!resp.ok) throw new Error(`Failed to create thread: ${resp.status}`);
+    if (!resp.ok) {
+      const errBody = (await resp.text().catch(() => '')) || resp.statusText;
+      throw new Error(`Failed to create thread (HTTP ${resp.status}): ${errBody.slice(0, 200)} [${corr}]`);
+    }
     const data = await resp.json();
     if (gen !== this.sessionGen) return ''; // superseded by a role/backend switch
     this.threadId = data.id;
+    this.currentThreadSubject.next(data.id);
 
     // Create session watch so the subscriber knows to dispatch responses
     await this.ensureWatch();
@@ -197,7 +342,9 @@ export class AssemblyBackendService {
   private async loadThreadHistory(): Promise<void> {
     if (!this.threadId) return;
     try {
-      const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${this.threadId}`);
+      const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${this.threadId}`, {
+        headers: { 'X-Request-Id': nextCorrelationId() },
+      });
       if (!resp.ok) return;
       const data: AssemblyThread = await resp.json();
       const comments = data.comments || [];
@@ -214,12 +361,23 @@ export class AssemblyBackendService {
     this.pollTimer = setInterval(() => this.pollThread(), POLL_INTERVAL_MS);
   }
 
+  /** Consecutive poll failures — used to surface a persistent transport
+   *  failure visibly (P0-1: "polling failure: silent retry"). */
+  private consecutivePollFailures = 0;
+
   /** Poll the current thread for new comments from agent roles. */
   private async pollThread(): Promise<void> {
     if (!this.threadId || this.isSubmitting) return;
+    const corr = nextCorrelationId();
     try {
-      const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${this.threadId}`);
-      if (!resp.ok) return;
+      const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${this.threadId}`, {
+        headers: { 'X-Request-Id': corr },
+      });
+      if (!resp.ok) {
+        this.notePollFailure(corr, `HTTP ${resp.status}`);
+        return;
+      }
+      this.consecutivePollFailures = 0;
       const data: AssemblyThread = await resp.json();
       const comments = data.comments || [];
       if (comments.length > this.lastCommentCount) {
@@ -227,8 +385,23 @@ export class AssemblyBackendService {
         this.syncCommentsToState(comments);
       }
     } catch {
-      // Network hiccup — retry next interval
+      this.notePollFailure(corr, 'network error');
     }
+  }
+
+  /** Count a poll failure; surface a visible message after the second
+   *  consecutive failure (≈6s), once. The next successful poll clears it. */
+  private notePollFailure(corr: string, why: string): void {
+    this.consecutivePollFailures++;
+    if (this.consecutivePollFailures !== 2) return;
+    const sysMsg: ChatMessage = {
+      id: 'err-poll-' + Date.now(),
+      role: 'system',
+      content: `⚠️  Connection to assembly-srv lost (${why}) — still retrying. Agent replies may be delayed. (${corr})`,
+      timestamp: new Date(),
+    };
+    const current = this.architectChatSubject.getValue();
+    this.architectChatSubject.next([...current, sysMsg]);
   }
 
   /** Convert Assembly comments to ChatMessage and AgentLog arrays. */
@@ -253,6 +426,16 @@ export class AssemblyBackendService {
           content: body,
           timestamp,
         });
+      } else if (role === 'thinking') {
+        // The agent's reasoning trace (posted by the subscriber before the
+        // response) — rendered as a collapsible "thinking" block, Freebuff
+        // style. Kept out of the builder/stream panel.
+        leftMessages.push({
+          id: c.id,
+          role: 'thinking',
+          content: body,
+          timestamp,
+        });
       } else if (role === 'system' && this.isSystemErrorComment(body)) {
         leftMessages.push({
           id: c.id,
@@ -262,8 +445,18 @@ export class AssemblyBackendService {
         });
         // The error comment IS the response for this turn — the subscriber
         // already failed fast (e.g. lease gate). Clear the no-response
-        // timer so the user doesn't get a spurious timeout notice on top.
+        // timer so the user doesn't get a spurious timeout notice on top,
+        // and surface the failure in the stream panel as a red entry too.
         this.clearNoResponseTimer();
+        this.agentWorkingSubject.next(false);
+        rightLogs.push({
+          id: c.id + '-err',
+          agent: 'builder',
+          action: 'Error',
+          details: body.slice(0, 500),
+          status: 'error',
+          timestamp,
+        });
       }
 
       // Messages from the right-panel role → BuilderStream
@@ -278,9 +471,12 @@ export class AssemblyBackendService {
         });
       }
 
-      // Agent response arrived — clear the no-response timeout
+      // Agent response arrived — clear the no-response timeout and the
+      // in-flight working indicator (the synthetic pending log is dropped by
+      // this rebuild).
       if (role === this.leftRole || role === this.rightRole) {
         this.clearNoResponseTimer();
+        this.agentWorkingSubject.next(false);
       }
 
       // Agent-to-agent delegation: left role's message that mentions right role
@@ -303,10 +499,11 @@ export class AssemblyBackendService {
   /** Ensure a session_watch exists for the current thread. */
   private async ensureWatch(): Promise<void> {
     if (this.watchCreated || !this.threadId) return;
+    const corr = nextCorrelationId();
     try {
-      await fetch(`${ASSEMBLY_URL}/api/duality/watches`, {
+      const resp = await fetch(`${ASSEMBLY_URL}/api/duality/watches`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': corr },
         body: JSON.stringify({
           threadId: this.threadId,
           forumSlug: FORUM_SLUG,
@@ -316,6 +513,12 @@ export class AssemblyBackendService {
           idleTimeoutMs: 300_000,
         }),
       });
+      // P0-1: a 4xx/5xx here is NOT a created watch — don't mark it as one,
+      // or the subscriber silently never gets told to respond.
+      if (!resp.ok) {
+        const errBody = (await resp.text().catch(() => '')) || resp.statusText;
+        throw new Error(`HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+      }
       this.watchCreated = true;
     } catch (err) {
       console.error('[AssemblyBackend] Failed to create session watch:', err);
@@ -323,7 +526,7 @@ export class AssemblyBackendService {
       const sysMsg: ChatMessage = {
         id: 'err-watch-' + Date.now(),
         role: 'system',
-        content: `⚠️  Could not create session watch for **${this.leftRole}** — the subscriber won't know to respond. Is assembly-srv running?`,
+        content: `⚠️  Could not create session watch for **${this.leftRole}** — the subscriber won't know to respond. Is assembly-srv running? (${err instanceof Error ? err.message : String(err)}) [${corr}]`,
         timestamp: new Date(),
       };
       const current = this.architectChatSubject.getValue();
@@ -422,6 +625,9 @@ export class AssemblyBackendService {
     };
     const current = this.architectChatSubject.getValue();
     this.architectChatSubject.next([...current, sysMsg]);
+    // End the in-flight indicator and show the timeout as a red stream entry.
+    this.agentWorkingSubject.next(false);
+    this.pushStreamError(`No response from ${this.leftRole} within ${timeoutSec}s.${detail}`);
   }
 
   private clearNoResponseTimer(): void {
@@ -454,7 +660,7 @@ export class AssemblyBackendService {
       //    immediately, not silently wait out the 90s timeout.
       const postResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${tid}/comments`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': nextCorrelationId() },
         body: JSON.stringify({
           body: content,
           postedById: ENGINEER_ID,
@@ -471,11 +677,29 @@ export class AssemblyBackendService {
       //    timeout (90s freebuff / 30s harness)
       this.armNoResponseTimer();
 
-      // 4. Poll immediately for the response (frontend polling handles
+      // 4. In-flight turn indicator: the streaming cursor in the chat panel
+      //    and the pending "working" card in the stream panel turn on now,
+      //    and turn off when the agent's reply comment arrives (poll).
+      this.agentWorkingSubject.next(true);
+      const pendingLog: AgentLog = {
+        id: 'pending-' + Date.now(),
+        agent: this.leftRole,
+        action: 'Working on your request',
+        details: content.slice(0, 200),
+        status: 'pending',
+        timestamp: new Date(),
+      };
+      this.builderLogsSubject.next([...this.builderLogsSubject.getValue(), pendingLog]);
+
+      // 5. Poll immediately for the response (frontend polling handles
       //    the case where the subscriber daemon isn't running yet)
       await this.pollThread();
     } catch (err) {
       console.error('[AssemblyBackend] sendUserMessage error:', err);
+      this.agentWorkingSubject.next(false);
+      // The lookup-failure path already pushed its own visible system message
+      // — don't double-report it here (P0-1).
+      if (err instanceof SessionLookupUnavailableError) return;
       // Surface the actual error to the user instead of a silent timeout
       const sysMsg: ChatMessage = {
         id: 'err-send-' + Date.now(),
@@ -485,9 +709,23 @@ export class AssemblyBackendService {
       };
       const current = this.architectChatSubject.getValue();
       this.architectChatSubject.next([...current, sysMsg]);
+      this.pushStreamError(`Failed to send message: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       this.isSubmitting = false;
     }
+  }
+
+  /** Push an error entry into the stream panel (right panel). */
+  private pushStreamError(details: string): void {
+    const errLog: AgentLog = {
+      id: 'err-log-' + Date.now(),
+      agent: this.leftRole,
+      action: 'Error',
+      details: details.slice(0, 500),
+      status: 'error',
+      timestamp: new Date(),
+    };
+    this.builderLogsSubject.next([...this.builderLogsSubject.getValue(), errLog]);
   }
 
   /** Clean up polling and timers on destroy. */

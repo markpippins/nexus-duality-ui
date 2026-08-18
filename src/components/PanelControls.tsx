@@ -1,5 +1,5 @@
 import React from 'react';
-import { Cpu, Zap } from 'lucide-react';
+import { Cpu, Zap, TerminalSquare } from 'lucide-react';
 import { ExecutionBackend } from '../services/AssemblyBackendService';
 
 export interface TackleRole {
@@ -19,13 +19,15 @@ interface PanelControlsProps {
 }
 
 /**
- * Per-panel control bar: the agent role selector + the leased/harness
- * execution switch for ONE panel. Rendered above the panel it controls —
- * each panel (left chat, right stream) has its own, so the two agents can
- * run in different modes.
+ * Per-panel control bar: the agent role selector + the execution-mode
+ * switch for ONE panel. Rendered above the panel it controls — each panel
+ * (left chat, right stream) has its own, so the two agents can run in
+ * different modes.
  *
- * Leased = interactive polling-loop agent (needs an ACTIVE role lease);
- * Harness = cloud executor (opencode/codex/gemini launched with a prompt).
+ * Operator = direct operator-svc /chat call (the nexus-console messagebox
+ *            mechanism — persistent provider session, no lease);
+ * Leased   = interactive polling-loop agent (needs an ACTIVE role lease);
+ * Harness  = cloud executor (opencode/codex/gemini launched with a prompt).
  */
 export function PanelControls({
   title,
@@ -61,19 +63,20 @@ export function PanelControls({
         </select>
       </div>
 
-      {/* Execution mode switch — leased vs harness, applies to NEW sessions */}
+      {/* Execution mode switch — operator vs leased vs harness, applies to NEW sessions */}
       <div
         className="flex items-center gap-1.5"
         title={
-          'Execution mode for this panel: Leased = interactive polling-loop agent ' +
-          '(requires an ACTIVE role lease — the agent must have acquired one and be ' +
-          'listening); Harness = cloud executor (opencode/codex/gemini launched with ' +
+          'Execution mode for this panel: Operator = direct operator-svc /chat call ' +
+          '(the nexus-console messagebox mechanism — persistent provider session, no ' +
+          'lease needed); Leased = interactive polling-loop agent (requires an ACTIVE ' +
+          'role lease); Harness = cloud executor (opencode/codex/gemini launched with ' +
           'a prompt, no lease needed)'
         }
       >
-        <Zap className="w-3.5 h-3.5 text-amber-400" />
+        <TerminalSquare className="w-3.5 h-3.5 text-emerald-400" />
         <div className="flex bg-gray-800 rounded-md border border-gray-700 p-0.5">
-          {(['harness', 'freebuff'] as const).map(b => (
+          {(['operator', 'freebuff', 'harness'] as const).map(b => (
             <button
               key={b}
               onClick={() => onExecutionBackendChange(b)}
@@ -84,7 +87,7 @@ export function PanelControls({
                   : 'text-gray-400 hover:text-gray-200')
               }
             >
-              {b === 'freebuff' ? 'Leased' : 'Harness'}
+              {b === 'freebuff' ? 'Leased' : b === 'operator' ? 'Operator' : 'Harness'}
             </button>
           ))}
         </div>
