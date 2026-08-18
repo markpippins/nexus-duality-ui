@@ -82,6 +82,40 @@ export interface SessionSummary {
   replyCount: number;
 }
 
+/** One SSE envelope from GET /api/duality/sessions/:threadId/events
+ *  (duality.session_events, V113). The typed turn/comment/watch envelopes
+ *  are self-describing: payload carries role/backend (+ failure_detail,
+ *  job_id, response_comment_id on terminal turns). */
+interface SseEnvelope {
+  seq: number;
+  eventType: string;
+  threadId: string;
+  turnId: string | null;
+  watchId: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+/** Parse the `data:` payload of an SSE event into an envelope; null on
+ *  malformed data (a bad frame must never break the stream consumer). */
+function parseSseEnvelope(ev: Event): SseEnvelope | null {
+  try {
+    const data = JSON.parse((ev as MessageEvent).data);
+    if (!data || typeof data !== 'object' || typeof data.seq !== 'number') return null;
+    return {
+      seq: data.seq,
+      eventType: String(data.eventType || ''),
+      threadId: String(data.threadId || ''),
+      turnId: data.turnId ?? null,
+      watchId: data.watchId ?? null,
+      payload: (data.payload && typeof data.payload === 'object') ? data.payload : {},
+      createdAt: String(data.createdAt || new Date().toISOString()),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export class AssemblyBackendService {
   // Streams — same interface as SimulatedBackendService
   private architectChatSubject = new BehaviorSubject<ChatMessage[]>([]);
@@ -133,6 +167,22 @@ export class AssemblyBackendService {
    *  indicator before the subscriber creates the new turn. */
   private lastSendAt = 0;
 
+  // ── Replayable SSE session event stream (P1 items 4-5) ────────────
+  // GET /api/duality/sessions/:threadId/events?after=<seq> — typed turn /
+  // comment / watch envelopes from the durable duality.session_events log.
+  // The stream drives the turn lifecycle immediately (accepted → running →
+  // completed/failed/timed_out) and nudges a comment poll on comment
+  // envelopes; the REST poll stays as the resilient fallback + finite
+  // history. The after-cursor is persisted per thread, so a reconnect or
+  // page reload resumes exactly where the stream left off — no full-thread
+  // refetch or count-based change detection for the lifecycle.
+  private eventSource: EventSource | null = null;
+  private sseReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private sseRetryMs = 1000;
+  private sseCursor = 0;
+  private sseThreadId: string | null = null;
+  private ssePollDebounce: ReturnType<typeof setTimeout> | null = null;
+
   /** Configure which roles the left and right panels represent.
    *  Resets session state so ensureThread re-queries for the new role's active watch. */
   setRoles(left: string, right: string): void {
@@ -153,6 +203,7 @@ export class AssemblyBackendService {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.disconnectEventStream();
     this.clearNoResponseTimer();
   }
 
@@ -181,6 +232,7 @@ export class AssemblyBackendService {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.disconnectEventStream();
     this.clearNoResponseTimer();
   }
 
@@ -222,6 +274,7 @@ export class AssemblyBackendService {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.disconnectEventStream();
     this.threadId = threadId;
     this.currentThreadSubject.next(threadId);
     this.agentWorkingSubject.next(false);
@@ -244,6 +297,7 @@ export class AssemblyBackendService {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.disconnectEventStream();
     this.threadId = null;
     this.currentThreadSubject.next(null);
     this.agentWorkingSubject.next(false);
@@ -394,10 +448,198 @@ export class AssemblyBackendService {
     }
   }
 
-  /** Start polling the thread for new comments. */
+  /** Start polling the thread for new comments + open the SSE stream. */
   private startPolling(): void {
     if (this.pollTimer) return;
     this.pollTimer = setInterval(() => this.pollThread(), POLL_INTERVAL_MS);
+    this.connectEventStream();
+  }
+
+  // ── Replayable SSE session event stream ────────────────────────────
+
+  private cursorStorageKey(): string {
+    return `duality-sse-cursor:${this.threadId ?? ''}`;
+  }
+
+  /** Resume cursor — last seen sequence for the current thread, persisted
+   *  so a reload / iframe remount reconnects with after=<cursor> and never
+   *  re-replays old envelopes (P1 item 5: "the browser reconnects with
+   *  after; no full-thread refetch"). */
+  private loadSseCursor(): number {
+    try {
+      return Number(localStorage.getItem(this.cursorStorageKey()) || 0) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private saveSseCursor(seq: number): void {
+    this.sseCursor = Math.max(this.sseCursor, seq);
+    try {
+      localStorage.setItem(this.cursorStorageKey(), String(this.sseCursor));
+    } catch {
+      // noop — cursor is in-memory too
+    }
+  }
+
+  private closeEventSource(): void {
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+  }
+
+  /** Open the replayable SSE stream for the current thread (reconnect with
+   *  the persisted after-cursor). Guarded so node test runs (no EventSource)
+   *  are unaffected. On error, backs off and reconnects with the updated
+   *  cursor; the REST poll remains the resilient fallback meanwhile. */
+  private connectEventStream(): void {
+    if (typeof EventSource === 'undefined') return; // node tests
+    if (!this.threadId) return;
+    this.closeEventSource();
+    this.sseThreadId = this.threadId;
+    const cursor = this.loadSseCursor();
+    const es = new EventSource(
+      `${ASSEMBLY_URL}/api/duality/sessions/${this.threadId}/events?after=${cursor}`
+    );
+
+    // Map SSE event_type → turn state (self-describing envelopes).
+    const TURN_STATES: Record<string, TurnState['state']> = {
+      'turn.accepted': 'accepted',
+      'turn.started': 'running',
+      'turn.completed': 'completed',
+      'turn.failed': 'failed',
+      'turn.timed_out': 'timed_out',
+      'turn.cancelled': 'cancelled',
+    };
+    for (const [eventName, state] of Object.entries(TURN_STATES)) {
+      es.addEventListener(eventName, (ev) => {
+        const d = parseSseEnvelope(ev);
+        if (d && d.seq) this.saveSseCursor(d.seq);
+        this.onTurnEnvelope(state, d);
+      });
+    }
+
+    // Comment envelopes: advance the cursor and nudge an immediate poll so
+    // the new comment (thinking trace / agent reply) renders without waiting
+    // for the next poll tick. Full bodies still come from Assembly REST.
+    for (const eventName of ['comment.created', 'thinking']) {
+      es.addEventListener(eventName, (ev) => {
+        const d = parseSseEnvelope(ev);
+        if (d && d.seq) this.saveSseCursor(d.seq);
+        this.debouncedCommentPoll();
+      });
+    }
+
+    es.addEventListener('watch.status', (ev) => {
+      const d = parseSseEnvelope(ev);
+      if (d && d.seq) this.saveSseCursor(d.seq);
+      // A closed watch is surfaced by the /watches diagnostics on timeout;
+      // no immediate UI action needed here.
+    });
+
+    es.addEventListener('heartbeat', (ev) => {
+      const d = parseSseEnvelope(ev);
+      if (d && d.seq) this.saveSseCursor(d.seq);
+    });
+
+    es.addEventListener('connected', () => {
+      this.sseRetryMs = 1000; // healthy — reset backoff
+    });
+
+    es.onerror = () => {
+      // Connection dropped — close and reconnect with the updated cursor.
+      es.close();
+      if (this.eventSource === es) this.eventSource = null;
+      if (this.sseReconnectTimer) clearTimeout(this.sseReconnectTimer);
+      this.sseReconnectTimer = setTimeout(() => {
+        this.sseReconnectTimer = null;
+        if (this.threadId && this.threadId === this.sseThreadId) {
+          this.connectEventStream();
+        }
+      }, this.sseRetryMs);
+      this.sseRetryMs = Math.min(this.sseRetryMs * 2, 30_000);
+    };
+
+    this.eventSource = es;
+  }
+
+  /** Reconcile the working indicator + turn envelope from a turn.* SSE
+   *  envelope — the authoritative server lifecycle, delivered the instant
+   *  it happens instead of on the next poll tick or /turns/latest fetch. */
+  private onTurnEnvelope(state: TurnState['state'], d: SseEnvelope | null): void {
+    if (!this.threadId) return;
+    // Guard against a stale envelope arriving after a role/backend switch.
+    if (d && d.threadId && d.threadId !== this.threadId) return;
+
+    const inFlight = state === 'accepted' || state === 'running';
+    if (inFlight) {
+      this.agentWorkingSubject.next(true);
+    } else {
+      this.agentWorkingSubject.next(false);
+      this.clearNoResponseTimer();
+      if ((state === 'failed' || state === 'timed_out') && d?.payload?.failure_detail) {
+        this.pushStreamError(
+          `Agent ${d.payload.role || this.leftRole} ${state}: ${String(d.payload.failure_detail).slice(0, 300)}`
+        );
+      }
+    }
+
+    const turn = this.toTurnState(state, d);
+    if (turn) this.turnStateSubject.next(turn);
+  }
+
+  /** Build a TurnState envelope from a self-describing SSE envelope so the
+   *  UI can render queued/running + failure detail without an extra fetch. */
+  private toTurnState(state: TurnState['state'], d: SseEnvelope | null): TurnState | null {
+    const p = d?.payload ?? {};
+    const ts = d?.createdAt ?? new Date().toISOString();
+    const stamp = (s: string): string | null => (state === s ? ts : null);
+    return {
+      id: d?.turnId ?? '',
+      thread_id: d?.threadId ?? this.threadId ?? '',
+      role: String(p.role ?? this.leftRole),
+      execution_backend: (p.backend ?? this.executionBackend) as TurnState['execution_backend'],
+      state,
+      request_comment_id: p.request_comment_id ? String(p.request_comment_id) : null,
+      response_comment_id: p.response_comment_id ? String(p.response_comment_id) : null,
+      subscriber_id: 'cascade-interactive-turn',
+      job_id: p.job_id ? String(p.job_id) : null,
+      execution_plan_version: p.execution_plan_version ? String(p.execution_plan_version) : null,
+      failure_detail: p.failure_detail ? String(p.failure_detail) : null,
+      created_at: ts,
+      updated_at: ts,
+      accepted_at: stamp('accepted'),
+      running_at: stamp('running'),
+      completed_at: stamp('completed'),
+      failed_at: stamp('failed'),
+      timed_out_at: stamp('timed_out'),
+      cancelled_at: stamp('cancelled'),
+    };
+  }
+
+  /** Debounced immediate poll after a comment envelope — collapse bursts
+   *  (thinking + reply) into one fetch. */
+  private debouncedCommentPoll(): void {
+    if (this.ssePollDebounce) clearTimeout(this.ssePollDebounce);
+    this.ssePollDebounce = setTimeout(() => {
+      this.ssePollDebounce = null;
+      void this.pollThread();
+    }, 250);
+  }
+
+  /** Tear down the SSE stream + reconnect/backoff timers. */
+  private disconnectEventStream(): void {
+    this.closeEventSource();
+    if (this.sseReconnectTimer) {
+      clearTimeout(this.sseReconnectTimer);
+      this.sseReconnectTimer = null;
+    }
+    if (this.ssePollDebounce) {
+      clearTimeout(this.ssePollDebounce);
+      this.ssePollDebounce = null;
+    }
+    this.sseThreadId = null;
   }
 
   /** Consecutive poll failures — used to surface a persistent transport
@@ -807,12 +1049,13 @@ export class AssemblyBackendService {
     this.builderLogsSubject.next([...this.builderLogsSubject.getValue(), errLog]);
   }
 
-  /** Clean up polling and timers on destroy. */
+  /** Clean up polling, timers, and the SSE stream on destroy. */
   destroy(): void {
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
+    this.disconnectEventStream();
     this.clearNoResponseTimer();
   }
 

@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsc --noEmit && node tests/p0-1-errors.mjs"
+    "test": "tsc --noEmit && node tests/p0-1-errors.mjs && node tests/sse-stream.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
