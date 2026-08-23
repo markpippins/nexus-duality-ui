@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { cn } from '../lib/utils';
+import { NEBULA_SRV } from '../lib/endpoint';
 
-const NEBULA_SRV = 'http://localhost:3101';
+// T25 3.2 (R-A-2026-08-15-008): runtime lookup > env > legacy localhost.
 const POLL_MS = 15000;
 
 interface SubscriberStatusData {
@@ -21,11 +22,17 @@ interface SubscriberStatusData {
  */
 export function SubscriberStatus() {
   const [status, setStatus] = useState<SubscriberStatusData | null>(null);
+  const [nebulaSrv, setNebulaSrv] = useState<string>(NEBULA_SRV.initial);
 
   useEffect(() => {
+    // Non-blocking runtime lookup — refines the URL unless the user set an
+    // explicit override in localStorage (refine() no-ops in that case).
     let cancelled = false;
+    void NEBULA_SRV.refine().then((url) => {
+      if (url && !cancelled) setNebulaSrv(url);
+    });
     const check = () => {
-      fetch(`${NEBULA_SRV}/api/cascade/subscriber-status`, {
+      fetch(`${nebulaSrv}/api/cascade/subscriber-status`, {
         signal: AbortSignal.timeout(5000),
       })
         .then(r => r.json())
@@ -39,7 +46,7 @@ export function SubscriberStatus() {
     check();
     const timer = setInterval(check, POLL_MS);
     return () => { cancelled = true; clearInterval(timer); };
-  }, []);
+  }, [nebulaSrv]);
 
   const up = status?.up ?? null; // null → unknown (first load / API unreachable)
 

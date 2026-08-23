@@ -5,6 +5,7 @@ import { cn } from '../lib/utils';
 import { motion, AnimatePresence } from 'motion/react';
 import { ExecutionBackend, TurnState } from '../services/AssemblyBackendService';
 import { PanelControls, TackleRole } from './PanelControls';
+import { NEBULA_SRV } from '../lib/endpoint';
 
 interface ArchitectChatProps {
   role: string;
@@ -15,7 +16,7 @@ interface ArchitectChatProps {
   onExecutionBackendChange: (backend: ExecutionBackend) => void;
 }
 
-const NEBULA_SRV = 'http://localhost:3101';
+// T25 3.2 (R-A-2026-08-15-008): runtime lookup > env > legacy localhost.
 
 /** Raw tackle.role_leases row as served by GET /api/role-leases. */
 interface RoleLeaseRow {
@@ -115,6 +116,13 @@ export function ArchitectChat({
   // an exact reason. Mirror that logic here so the user knows the exact
   // failure reason BEFORE sending.
   const [leaseWarning, setLeaseWarning] = useState<LeaseWarning>({ kind: 'none' });
+  const [nebulaSrv, setNebulaSrv] = useState<string>(NEBULA_SRV.initial);
+
+  useEffect(() => {
+    // Non-blocking runtime lookup — refines the URL unless the user set an
+    // explicit override in localStorage (refine() no-ops in that case).
+    void NEBULA_SRV.refine().then((url) => { if (url) setNebulaSrv(url); });
+  }, []);
 
   useEffect(() => {
     // engineer is the Freebuff-hosted role — runs in this interactive
@@ -127,7 +135,7 @@ export function ArchitectChat({
     setLeaseWarning({ kind: 'loading' });
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 4000);
-    fetch(`${NEBULA_SRV}/api/role-leases?role=${encodeURIComponent(role)}`, { signal: ctrl.signal })
+    fetch(`${nebulaSrv}/api/role-leases?role=${encodeURIComponent(role)}`, { signal: ctrl.signal })
       .then(r => r.json())
       .then((data: { items?: RoleLeaseRow[] }) => {
         if (cancelled) return;
@@ -136,7 +144,7 @@ export function ArchitectChat({
       .catch(() => { if (!cancelled) setLeaseWarning({ kind: 'unavailable' }); })
       .finally(() => clearTimeout(timer));
     return () => { cancelled = true; ctrl.abort(); clearTimeout(timer); };
-  }, [role]);
+  }, [role, nebulaSrv]);
 
   const handleSend = (e: React.FormEvent) => {
     e.preventDefault();

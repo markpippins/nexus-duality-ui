@@ -146,6 +146,111 @@ export class AssemblyBackendService {
   private fileTreeSubject = new BehaviorSubject<FileNode[]>([]);
   public fileTree$ = this.fileTreeSubject.asObservable();
 
+  /**
+   * Live file-tree mode (from the file-tree provider below):
+   * 'live' = loaded from file-system-server:4042; 'mock' = simulated only.
+   * Selected via VITE_DUALITY_FILE_MODE; defaults to live for the installed
+   * unit. Distinct from chat/session liveness (AssemblyBackendService).
+   */
+  private fileMode: 'live' | 'mock' =
+    (import.meta as any).env?.VITE_DUALITY_FILE_MODE === 'mock' ? 'mock' : 'live';
+  private fileSrvBase: string =
+    (import.meta as any).env?.VITE_FILE_SRV_URL || 'http://localhost:4042';
+  private fileTreeErrorSubject = new BehaviorSubject<string | null>(null);
+  public fileTreeError$ = this.fileTreeErrorSubject.asObservable();
+
+  public isLiveFileMode(): boolean {
+    return this.fileMode === 'live';
+  }
+
+  private async fileSrvRequest<T>(url: string, init?: RequestInit): Promise<T> {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      let detail = `${res.status} ${res.statusText}`;
+      try {
+        const body = await res.json();
+        if (body && typeof body.detail === 'string') detail = body.detail;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(`file-system-server ${detail}`);
+    }
+    return (await res.json()) as T;
+  }
+
+  private encodePath(parts: string[]): string {
+    return encodeURIComponent(parts.join('/'));
+  }
+
+  private toFileNode(e: { name: string; type: string; path?: string }): FileNode {
+    const isDir = e.type === 'directory';
+    return {
+      id: e.path || e.name,
+      name: e.name,
+      type: isDir ? 'folder' : 'file',
+      isOpen: false,
+      children: isDir ? [] : undefined,
+    };
+  }
+
+  /**
+   * Load the active workspace file tree from the real file-system-server
+   * (:4042) in live mode. Failures surface as a visible error on
+   * fileTreeError$ — never a simulated tree.
+   */
+  public async loadLiveFileTree(path: string[] = []): Promise<void> {
+    if (this.fileMode !== 'live') return;
+    try {
+      const q = path.length > 0 ? `?path=${this.encodePath(path)}` : '';
+      const data = await this.fileSrvRequest<{ entries: Array<{ name: string; type: string; path?: string }> }>(
+        `${this.fileSrvBase}/api/fs${q}`,
+      );
+      const entries = (data.entries ?? []).map(e => this.toFileNode(e));
+      // Build a single root node named after the fs root so the sidebar
+      // renders a real tree instead of an empty placeholder.
+      const rootName = (this.fileSrvBase.includes('localhost') ? 'localhost' : 'fs');
+      this.fileTreeSubject.next([{
+        id: 'fs-root',
+        name: rootName,
+        type: 'folder',
+        isOpen: true,
+        children: entries,
+      }]);
+      this.fileTreeErrorSubject.next(null);
+    } catch (err: any) {
+      this.fileTreeErrorSubject.next(err?.message || 'Failed to load live file tree');
+    }
+  }
+
+  /**
+   * Read a file's content from the live file-service. Throws on failure so
+   * the UI can surface it.
+   */
+  public async readLiveFile(path: string[], name: string): Promise<string> {
+    if (this.fileMode !== 'live') return '';
+    const full = [...path, name];
+    const data = await this.fileSrvRequest<{ content: string }>(
+      `${this.fileSrvBase}/api/fs/content?path=${this.encodePath(full)}`,
+    );
+    return data.content ?? '';
+  }
+
+  /**
+   * Persist an edited file through the live file-service. Throws on failure.
+   */
+  public async saveLiveFile(path: string[], name: string, content: string): Promise<void> {
+    if (this.fileMode !== 'live') return;
+    const full = [...path, name];
+    await this.fileSrvRequest(
+      `${this.fileSrvBase}/api/fs/content?path=${this.encodePath(full)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      },
+    );
+  }
+
   // Session state
   private threadId: string | null = null;
   /** Observable of the currently-loaded thread (null = none yet). */
