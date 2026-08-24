@@ -1,1 +1,9 @@
 @import "tailwindcss";
+
+/* Native select listboxes ignore the dark container and render option text on
+   the browser's white listbox — inherited light-grey text becomes unreadable.
+   Pin option colors so the open dropdown matches the gray-800 theme. */
+select option {
+  background-color: #1f2937; /* gray-800 */
+  color: #e5e7eb; /* gray-200 */
+}

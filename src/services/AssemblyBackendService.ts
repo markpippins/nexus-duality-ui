@@ -1,0 +1,1190 @@
+import { BehaviorSubject } from 'rxjs';
+import { Workspace, FileNode, ChatMessage, AgentLog } from '../types';
+
+const ASSEMBLY_URL = 'http://localhost:3107';
+const FORUM_SLUG = 'duality-sessions';
+const POLL_INTERVAL_MS = 3000;
+const ENGINEER_ID = 'af069ff6-760c-44cb-a0d4-11517164169b';
+
+/** Short per-request correlation id — attached as X-Request-Id and surfaced
+ *  in user-visible error messages so a failure can be traced to assembly-srv
+ *  request logs (Analyst P0-1: "Add request correlation IDs"). */
+function nextCorrelationId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Thrown by doEnsureThread when assembly-srv is unreachable/failing during
+ *  session lookup. The visible system message was already pushed by the
+ *  service; callers skip their own generic error to avoid double-reporting. */
+class SessionLookupUnavailableError extends Error {}
+
+// No-response timeout per execution backend. Harness (opencode /run-direct)
+// sessions typically reply in ~15s, so a failure surfaces after 30s instead
+// of forcing a full 90s wait. Freebuff interactive turns can legitimately
+// take longer — keep the original 90s there. Operator (operator-svc /chat)
+// is a synchronous inference call like nexus-console's messagebox; the
+// subscriber allows 300s there, so the notice timer mirrors that.
+const NO_RESPONSE_TIMEOUT_MS: Record<ExecutionBackend, number> = {
+  operator: 300_000,
+  freebuff: 90_000,
+  harness: 120_000, // harness-srv now reports timeouts honestly (exit 124) — this timer is only a "slow" notice, not the failure signal
+};
+
+export type ExecutionBackend = 'operator' | 'freebuff' | 'harness';
+
+interface AssemblyComment {
+  id: string;
+  body: string;
+  role: string | null;
+  model: string | null;
+  createdAt: string;
+  author: { id: string; name: string; alias: string };
+}
+
+interface AssemblyThread {
+  id: string;
+  title: string;
+  body: string;
+  comments: AssemblyComment[];
+}
+
+/** Server-side turn/job state envelope (duality.session_turns, V112).
+ *  The UI renders this instead of inferring turn lifecycle from comment
+ *  count — the Analyst P0-1 item 3 contract. */
+export interface TurnState {
+  id: string;
+  thread_id: string;
+  role: string;
+  execution_backend: 'operator' | 'harness' | 'freebuff';
+  state: 'accepted' | 'running' | 'completed' | 'failed' | 'timed_out' | 'cancelled';
+  request_comment_id: string | null;
+  response_comment_id: string | null;
+  subscriber_id: string | null;
+  job_id: string | null;
+  execution_plan_version: string | null;
+  failure_detail: string | null;
+  created_at: string;
+  updated_at: string;
+  accepted_at: string | null;
+  running_at: string | null;
+  completed_at: string | null;
+  failed_at: string | null;
+  timed_out_at: string | null;
+  cancelled_at: string | null;
+}
+
+/** A past session thread, as listed by the session picker. */
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  lastReplyAt: string | null;
+  replyCount: number;
+}
+
+/** One SSE envelope from GET /api/duality/sessions/:threadId/events
+ *  (duality.session_events, V113). The typed turn/comment/watch envelopes
+ *  are self-describing: payload carries role/backend (+ failure_detail,
+ *  job_id, response_comment_id on terminal turns). */
+interface SseEnvelope {
+  seq: number;
+  eventType: string;
+  threadId: string;
+  turnId: string | null;
+  watchId: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
+/** Parse the `data:` payload of an SSE event into an envelope; null on
+ *  malformed data (a bad frame must never break the stream consumer). */
+function parseSseEnvelope(ev: Event): SseEnvelope | null {
+  try {
+    const data = JSON.parse((ev as MessageEvent).data);
+    if (!data || typeof data !== 'object' || typeof data.seq !== 'number') return null;
+    return {
+      seq: data.seq,
+      eventType: String(data.eventType || ''),
+      threadId: String(data.threadId || ''),
+      turnId: data.turnId ?? null,
+      watchId: data.watchId ?? null,
+      payload: (data.payload && typeof data.payload === 'object') ? data.payload : {},
+      createdAt: String(data.createdAt || new Date().toISOString()),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export class AssemblyBackendService {
+  // Streams — same interface as SimulatedBackendService
+  private architectChatSubject = new BehaviorSubject<ChatMessage[]>([]);
+  public architectChat$ = this.architectChatSubject.asObservable();
+
+  private builderLogsSubject = new BehaviorSubject<AgentLog[]>([]);
+  public builderLogs$ = this.builderLogsSubject.asObservable();
+
+  /**
+   * True while a turn is in flight (user message posted, agent reply not yet
+   * arrived). Drives the streaming cursor / "working" indicator in both
+   * panels — the roadmap's isStreaming flag was never set in real mode.
+   */
+  private agentWorkingSubject = new BehaviorSubject<boolean>(false);
+  public agentWorking$ = this.agentWorkingSubject.asObservable();
+
+  /** Latest server-side turn envelope for the current thread (null = none
+   *  yet). Drives the working indicator + status line from the subscriber's
+   *  authoritative lifecycle instead of comment-count inference. */
+  private turnStateSubject = new BehaviorSubject<TurnState | null>(null);
+  public turnState$ = this.turnStateSubject.asObservable();
+
+  // Legacy streams (kept for interface compatibility, not used for chat)
+  private workspacesSubject = new BehaviorSubject<Workspace[]>([]);
+  public workspaces$ = this.workspacesSubject.asObservable();
+  private activeWorkspaceSubject = new BehaviorSubject<Workspace | null>(null);
+  public activeWorkspace$ = this.activeWorkspaceSubject.asObservable();
+  private fileTreeSubject = new BehaviorSubject<FileNode[]>([]);
+  public fileTree$ = this.fileTreeSubject.asObservable();
+
+  /**
+   * Live file-tree mode (from the file-tree provider below):
+   * 'live' = loaded from file-system-server:4042; 'mock' = simulated only.
+   * Selected via VITE_DUALITY_FILE_MODE; defaults to live for the installed
+   * unit. Distinct from chat/session liveness (AssemblyBackendService).
+   */
+  private fileMode: 'live' | 'mock' =
+    (import.meta as any).env?.VITE_DUALITY_FILE_MODE === 'mock' ? 'mock' : 'live';
+  private fileSrvBase: string =
+    (import.meta as any).env?.VITE_FILE_SRV_URL || 'http://localhost:4042';
+  private fileTreeErrorSubject = new BehaviorSubject<string | null>(null);
+  public fileTreeError$ = this.fileTreeErrorSubject.asObservable();
+
+  public isLiveFileMode(): boolean {
+    return this.fileMode === 'live';
+  }
+
+  private async fileSrvRequest<T>(url: string, init?: RequestInit): Promise<T> {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      let detail = `${res.status} ${res.statusText}`;
+      try {
+        const body = await res.json();
+        if (body && typeof body.detail === 'string') detail = body.detail;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(`file-system-server ${detail}`);
+    }
+    return (await res.json()) as T;
+  }
+
+  private encodePath(parts: string[]): string {
+    return encodeURIComponent(parts.join('/'));
+  }
+
+  private toFileNode(e: { name: string; type: string; path?: string }): FileNode {
+    const isDir = e.type === 'directory';
+    return {
+      id: e.path || e.name,
+      name: e.name,
+      type: isDir ? 'folder' : 'file',
+      isOpen: false,
+      children: isDir ? [] : undefined,
+    };
+  }
+
+  /**
+   * Load the active workspace file tree from the real file-system-server
+   * (:4042) in live mode. Failures surface as a visible error on
+   * fileTreeError$ — never a simulated tree.
+   */
+  public async loadLiveFileTree(path: string[] = []): Promise<void> {
+    if (this.fileMode !== 'live') return;
+    try {
+      const q = path.length > 0 ? `?path=${this.encodePath(path)}` : '';
+      const data = await this.fileSrvRequest<{ entries: Array<{ name: string; type: string; path?: string }> }>(
+        `${this.fileSrvBase}/api/fs${q}`,
+      );
+      const entries = (data.entries ?? []).map(e => this.toFileNode(e));
+      // Build a single root node named after the fs root so the sidebar
+      // renders a real tree instead of an empty placeholder.
+      const rootName = (this.fileSrvBase.includes('localhost') ? 'localhost' : 'fs');
+      this.fileTreeSubject.next([{
+        id: 'fs-root',
+        name: rootName,
+        type: 'folder',
+        isOpen: true,
+        children: entries,
+      }]);
+      this.fileTreeErrorSubject.next(null);
+    } catch (err: any) {
+      this.fileTreeErrorSubject.next(err?.message || 'Failed to load live file tree');
+    }
+  }
+
+  /**
+   * Read a file's content from the live file-service. Throws on failure so
+   * the UI can surface it.
+   */
+  public async readLiveFile(path: string[], name: string): Promise<string> {
+    if (this.fileMode !== 'live') return '';
+    const full = [...path, name];
+    const data = await this.fileSrvRequest<{ content: string }>(
+      `${this.fileSrvBase}/api/fs/content?path=${this.encodePath(full)}`,
+    );
+    return data.content ?? '';
+  }
+
+  /**
+   * Persist an edited file through the live file-service. Throws on failure.
+   */
+  public async saveLiveFile(path: string[], name: string, content: string): Promise<void> {
+    if (this.fileMode !== 'live') return;
+    const full = [...path, name];
+    await this.fileSrvRequest(
+      `${this.fileSrvBase}/api/fs/content?path=${this.encodePath(full)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      },
+    );
+  }
+
+  // Session state
+  private threadId: string | null = null;
+  /** Observable of the currently-loaded thread (null = none yet). */
+  private currentThreadSubject = new BehaviorSubject<string | null>(null);
+  public currentThreadId$ = this.currentThreadSubject.asObservable();
+  private leftRole: string = 'architect';
+  private rightRole: string = 'builder';
+  // Execution backend for NEW sessions — 'freebuff' = interactive turn
+  // (turn.requested published on NATS, session owns context); 'harness' =
+  // ephemeral opencode run via harness-srv POST /run-direct.
+  private executionBackend: ExecutionBackend = 'freebuff';
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastCommentCount = 0;
+  private isSubmitting = false;
+  private watchCreated = false;
+  private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Epoch ms of the most recent send — terminal turn envelopes older than
+   *  this are the PREVIOUS turn, so they must not clear the in-flight
+   *  indicator before the subscriber creates the new turn. */
+  private lastSendAt = 0;
+
+  // ── Replayable SSE session event stream (P1 items 4-5) ────────────
+  // GET /api/duality/sessions/:threadId/events?after=<seq> — typed turn /
+  // comment / watch envelopes from the durable duality.session_events log.
+  // The stream drives the turn lifecycle immediately (accepted → running →
+  // completed/failed/timed_out) and nudges a comment poll on comment
+  // envelopes; the REST poll stays as the resilient fallback + finite
+  // history. The after-cursor is persisted per thread, so a reconnect or
+  // page reload resumes exactly where the stream left off — no full-thread
+  // refetch or count-based change detection for the lifecycle.
+  private eventSource: EventSource | null = null;
+  private sseReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private sseRetryMs = 1000;
+  private sseCursor = 0;
+  private sseThreadId: string | null = null;
+  private ssePollDebounce: ReturnType<typeof setTimeout> | null = null;
+
+  /** Configure which roles the left and right panels represent.
+   *  Resets session state so ensureThread re-queries for the new role's active watch. */
+  setRoles(left: string, right: string): void {
+    if (this.leftRole === left && this.rightRole === right) return;
+    this.leftRole = left;
+    this.rightRole = right;
+    // Reset so ensureThread() re-queries the server for the new role's watch
+    this.threadId = null;
+    this.currentThreadSubject.next(null);
+    this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    this.sessionGen++;
+    // Stop polling on the old thread + cancel any pending no-response
+    // timeout so a stale 90s timer can't fire against the new role.
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.disconnectEventStream();
+    this.clearNoResponseTimer();
+  }
+
+  /** Choose the execution backend for NEW sessions.
+   *
+   *  'freebuff' → interactive turn (the Freebuff session owns context, the
+   *  subscriber only emits turn.requested). 'harness' → ephemeral opencode
+   *  run via harness-srv /run-direct, context reconstructed from the thread.
+   *
+   *  Resets session state (same semantics as setRoles) so ensureThread()
+   *  starts a fresh session with the chosen backend. Existing sessions keep
+   *  their original backend — the resume path only matches a watch whose
+   *  execution_backend equals the current selection.
+   */
+  setExecutionBackend(backend: ExecutionBackend): void {
+    if (this.executionBackend === backend) return;
+    this.executionBackend = backend;
+    this.threadId = null;
+    this.currentThreadSubject.next(null);
+    this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    this.sessionGen++;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.disconnectEventStream();
+    this.clearNoResponseTimer();
+  }
+
+  private ensureThreadPromise: Promise<string> | null = null;
+  // Bumped on every role/backend switch; doEnsureThread discards its result
+  // if superseded mid-create (prevents committing a stale session).
+  private sessionGen = 0;
+
+  /** List past duality-sessions threads (newest first) for the session picker.
+   *  Throws on transport/HTTP failure so the picker can distinguish "no
+   *  sessions" from "can't reach assembly-srv" (P0-1). */
+  async listSessions(): Promise<SessionSummary[]> {
+    const corr = nextCorrelationId();
+    const resp = await fetch(`${ASSEMBLY_URL}/api/forums/${FORUM_SLUG}/threads`, {
+      headers: { 'X-Request-Id': corr },
+    });
+    if (!resp.ok) {
+      const errBody = (await resp.text().catch(() => '')) || resp.statusText;
+      throw new Error(`Failed to list sessions (HTTP ${resp.status}): ${errBody.slice(0, 200)} [${corr}]`);
+    }
+    const data = await resp.json();
+    const items = Array.isArray(data) ? data : (data.threads || data.items || []);
+    return items.map((t: Record<string, unknown>) => ({
+      id: String(t.id),
+      title: String(t.title || 'Untitled session'),
+      createdAt: String(t.createdAt || ''),
+      lastReplyAt: t.lastReplyAt ? String(t.lastReplyAt) : null,
+      replyCount: Number(t.replyCount || 0),
+    }));
+  }
+
+  /**
+   * Switch the UI to an existing session thread (session picker). Loads its
+   * history, (re)activates a watch so new turns are processed, and polls it.
+   */
+  async loadThread(threadId: string): Promise<void> {
+    this.clearNoResponseTimer();
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.disconnectEventStream();
+    this.threadId = threadId;
+    this.currentThreadSubject.next(threadId);
+    this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    this.sessionGen++;
+    await this.loadThreadHistory();
+    await this.ensureWatch();
+    this.startPolling();
+  }
+
+  /**
+   * Start a brand-new session: forget the current thread and create a fresh
+   * one for the current role/backend on the next ensureThread() call.
+   */
+  startNewSession(): void {
+    this.clearNoResponseTimer();
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.disconnectEventStream();
+    this.threadId = null;
+    this.currentThreadSubject.next(null);
+    this.agentWorkingSubject.next(false);
+    this.turnStateSubject.next(null);
+    this.watchCreated = false;
+    this.lastCommentCount = 0;
+    this.sessionGen++;
+    // Fire-and-forget: the panels re-render via architectChat$ once the new
+    // thread exists and its history is loaded.
+    void this.ensureThread().catch(() => {});
+  }
+
+  /** Create or resume a session thread. Returns the thread ID.
+   *  Public so ArchitectChat can call it on mount for immediate session load.
+   *  In-flight calls are deduped so rapid role/backend switches or React
+   *  StrictMode double effects cannot create duplicate empty sessions. */
+  ensureThread(): Promise<string> {
+    if (this.threadId) return Promise.resolve(this.threadId);
+    if (this.ensureThreadPromise) return this.ensureThreadPromise;
+    this.ensureThreadPromise = this.doEnsureThread().finally(() => {
+      this.ensureThreadPromise = null;
+    });
+    return this.ensureThreadPromise;
+  }
+
+  private async doEnsureThread(): Promise<string> {
+    if (this.threadId) return this.threadId;
+    const gen = this.sessionGen;
+
+    // Try server-side session lookup (survives browser clears / iframe reloads).
+    // P0-1: a 5xx/timeout/network failure here must NOT fall through to
+    // creating a new thread — that is how orphan duplicate sessions are born
+    // (the real conversation exists server-side but the UI can't see it).
+    // Only a definitive "no active watch" (200 with no threadId, or a 404)
+    // legitimately proceeds to creation.
+    const corr = nextCorrelationId();
+    let lookupUnavailable = false;
+    try {
+      // Pass the selected backend so the server returns the most recent
+      // session for THIS execution path (freebuff vs harness) instead of
+      // the globally most recent one — the backend-blind lookup previously
+      // returned the wrong session type and caused a silent new-thread
+      // creation, orphaning the real conversation.
+      const resp = await fetch(
+        `${ASSEMBLY_URL}/api/duality/watches/active?role=${encodeURIComponent(this.leftRole)}&forumSlug=${encodeURIComponent(FORUM_SLUG)}&execution_backend=${encodeURIComponent(this.executionBackend)}`,
+        { headers: { 'X-Request-Id': corr } }
+      );
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.threadId) {
+          // Verify thread still exists
+          const threadResp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${data.threadId}`, {
+            headers: { 'X-Request-Id': corr },
+          });
+          if (threadResp.ok) {
+            if (gen !== this.sessionGen) return ''; // superseded by a switch
+            this.threadId = data.threadId;
+            this.currentThreadSubject.next(data.threadId);
+            // Resume regardless of watch status — a session closed by the
+            // subscriber (e.g. lease-gate failure) must stay visible with its
+            // error history, or the user's message looks like it vanished.
+            // If the watch is not active (closed/missing), create a fresh
+            // active watch so new turns on this thread are processed.
+            const hasActiveWatch = await this.activeWatchMatchesBackend(data.threadId);
+            if (!hasActiveWatch) {
+              await this.ensureWatch();
+            }
+            this.startPolling();
+            await this.loadThreadHistory();
+            return this.threadId;
+          }
+          if (threadResp.status !== 404) {
+            // 5xx/timeout — the thread may still exist; do NOT create a new one.
+            lookupUnavailable = true;
+          }
+          // 404 → the old thread is really gone — proceed to create.
+        }
+      } else if (resp.status !== 404) {
+        lookupUnavailable = true;
+      }
+    } catch {
+      lookupUnavailable = true;
+    }
+
+    if (lookupUnavailable) {
+      // assembly-srv is down or failing — creating a new thread here would
+      // orphan the real conversation into a duplicate empty session. Surface
+      // the transport failure visibly; the next send re-attempts the lookup.
+      const sysMsg: ChatMessage = {
+        id: 'err-lookup-' + Date.now(),
+        role: 'system',
+        content: `⚠️  Could not reach assembly-srv to resume this session — not creating a duplicate. The next message will retry. (${corr})`,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, sysMsg]);
+      this.agentWorkingSubject.next(false);
+      throw new SessionLookupUnavailableError(
+        `Session lookup failed — assembly-srv unreachable [${corr}]`
+      );
+    }
+
+    // Create new thread — tag the title with the backend so sessions are
+    // identifiable in the forum at a glance.
+    const backendTag = this.executionBackend;
+    const title = `Session — ${this.leftRole} + ${this.rightRole} (${backendTag}) — ${new Date().toLocaleString()}`;
+    const resp = await fetch(`${ASSEMBLY_URL}/api/forums/duality-sessions/threads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Request-Id': corr },
+      body: JSON.stringify({
+        title,
+        body: `Interactive session: **${this.leftRole}** (left panel) ↔ **${this.rightRole}** (right panel). Backend: **${backendTag}**.`,
+        postedById: ENGINEER_ID,
+        role: 'system',
+        model: 'freebuff/deepseek-v4-flash',
+      }),
+    });
+    if (!resp.ok) {
+      const errBody = (await resp.text().catch(() => '')) || resp.statusText;
+      throw new Error(`Failed to create thread (HTTP ${resp.status}): ${errBody.slice(0, 200)} [${corr}]`);
+    }
+    const data = await resp.json();
+    if (gen !== this.sessionGen) return ''; // superseded by a role/backend switch
+    this.threadId = data.id;
+    this.currentThreadSubject.next(data.id);
+
+    // Create session watch so the subscriber knows to dispatch responses
+    await this.ensureWatch();
+
+    this.startPolling();
+    return this.threadId;
+  }
+
+  /** Load existing thread history into the chat state. */
+  private async loadThreadHistory(): Promise<void> {
+    if (!this.threadId) return;
+    try {
+      const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${this.threadId}`, {
+        headers: { 'X-Request-Id': nextCorrelationId() },
+      });
+      if (!resp.ok) return;
+      const data: AssemblyThread = await resp.json();
+      const comments = data.comments || [];
+      this.lastCommentCount = comments.length;
+      this.syncCommentsToState(comments);
+    } catch {
+      // Best-effort; polling will catch up
+    }
+  }
+
+  /** Start polling the thread for new comments + open the SSE stream. */
+  private startPolling(): void {
+    if (this.pollTimer) return;
+    this.pollTimer = setInterval(() => this.pollThread(), POLL_INTERVAL_MS);
+    this.connectEventStream();
+  }
+
+  // ── Replayable SSE session event stream ────────────────────────────
+
+  private cursorStorageKey(): string {
+    return `duality-sse-cursor:${this.threadId ?? ''}`;
+  }
+
+  /** Resume cursor — last seen sequence for the current thread, persisted
+   *  so a reload / iframe remount reconnects with after=<cursor> and never
+   *  re-replays old envelopes (P1 item 5: "the browser reconnects with
+   *  after; no full-thread refetch"). */
+  private loadSseCursor(): number {
+    try {
+      return Number(localStorage.getItem(this.cursorStorageKey()) || 0) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private saveSseCursor(seq: number): void {
+    this.sseCursor = Math.max(this.sseCursor, seq);
+    try {
+      localStorage.setItem(this.cursorStorageKey(), String(this.sseCursor));
+    } catch {
+      // noop — cursor is in-memory too
+    }
+  }
+
+  private closeEventSource(): void {
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+  }
+
+  /** Open the replayable SSE stream for the current thread (reconnect with
+   *  the persisted after-cursor). Guarded so node test runs (no EventSource)
+   *  are unaffected. On error, backs off and reconnects with the updated
+   *  cursor; the REST poll remains the resilient fallback meanwhile. */
+  private connectEventStream(): void {
+    if (typeof EventSource === 'undefined') return; // node tests
+    if (!this.threadId) return;
+    this.closeEventSource();
+    this.sseThreadId = this.threadId;
+    const cursor = this.loadSseCursor();
+    const es = new EventSource(
+      `${ASSEMBLY_URL}/api/duality/sessions/${this.threadId}/events?after=${cursor}`
+    );
+
+    // Map SSE event_type → turn state (self-describing envelopes).
+    const TURN_STATES: Record<string, TurnState['state']> = {
+      'turn.accepted': 'accepted',
+      'turn.started': 'running',
+      'turn.completed': 'completed',
+      'turn.failed': 'failed',
+      'turn.timed_out': 'timed_out',
+      'turn.cancelled': 'cancelled',
+    };
+    for (const [eventName, state] of Object.entries(TURN_STATES)) {
+      es.addEventListener(eventName, (ev) => {
+        const d = parseSseEnvelope(ev);
+        if (d && d.seq) this.saveSseCursor(d.seq);
+        this.onTurnEnvelope(state, d);
+      });
+    }
+
+    // Comment envelopes: advance the cursor and nudge an immediate poll so
+    // the new comment (thinking trace / agent reply) renders without waiting
+    // for the next poll tick. Full bodies still come from Assembly REST.
+    for (const eventName of ['comment.created', 'thinking']) {
+      es.addEventListener(eventName, (ev) => {
+        const d = parseSseEnvelope(ev);
+        if (d && d.seq) this.saveSseCursor(d.seq);
+        this.debouncedCommentPoll();
+      });
+    }
+
+    es.addEventListener('watch.status', (ev) => {
+      const d = parseSseEnvelope(ev);
+      if (d && d.seq) this.saveSseCursor(d.seq);
+      // A closed watch is surfaced by the /watches diagnostics on timeout;
+      // no immediate UI action needed here.
+    });
+
+    es.addEventListener('heartbeat', (ev) => {
+      const d = parseSseEnvelope(ev);
+      if (d && d.seq) this.saveSseCursor(d.seq);
+    });
+
+    es.addEventListener('connected', () => {
+      this.sseRetryMs = 1000; // healthy — reset backoff
+    });
+
+    es.onerror = () => {
+      // Connection dropped — close and reconnect with the updated cursor.
+      es.close();
+      if (this.eventSource === es) this.eventSource = null;
+      if (this.sseReconnectTimer) clearTimeout(this.sseReconnectTimer);
+      this.sseReconnectTimer = setTimeout(() => {
+        this.sseReconnectTimer = null;
+        if (this.threadId && this.threadId === this.sseThreadId) {
+          this.connectEventStream();
+        }
+      }, this.sseRetryMs);
+      this.sseRetryMs = Math.min(this.sseRetryMs * 2, 30_000);
+    };
+
+    this.eventSource = es;
+  }
+
+  /** Reconcile the working indicator + turn envelope from a turn.* SSE
+   *  envelope — the authoritative server lifecycle, delivered the instant
+   *  it happens instead of on the next poll tick or /turns/latest fetch. */
+  private onTurnEnvelope(state: TurnState['state'], d: SseEnvelope | null): void {
+    if (!this.threadId) return;
+    // Guard against a stale envelope arriving after a role/backend switch.
+    if (d && d.threadId && d.threadId !== this.threadId) return;
+
+    const inFlight = state === 'accepted' || state === 'running';
+    if (inFlight) {
+      this.agentWorkingSubject.next(true);
+    } else {
+      this.agentWorkingSubject.next(false);
+      this.clearNoResponseTimer();
+      if ((state === 'failed' || state === 'timed_out') && d?.payload?.failure_detail) {
+        this.pushStreamError(
+          `Agent ${d.payload.role || this.leftRole} ${state}: ${String(d.payload.failure_detail).slice(0, 300)}`
+        );
+      }
+    }
+
+    const turn = this.toTurnState(state, d);
+    if (turn) this.turnStateSubject.next(turn);
+  }
+
+  /** Build a TurnState envelope from a self-describing SSE envelope so the
+   *  UI can render queued/running + failure detail without an extra fetch. */
+  private toTurnState(state: TurnState['state'], d: SseEnvelope | null): TurnState | null {
+    const p = d?.payload ?? {};
+    const ts = d?.createdAt ?? new Date().toISOString();
+    const stamp = (s: string): string | null => (state === s ? ts : null);
+    return {
+      id: d?.turnId ?? '',
+      thread_id: d?.threadId ?? this.threadId ?? '',
+      role: String(p.role ?? this.leftRole),
+      execution_backend: (p.backend ?? this.executionBackend) as TurnState['execution_backend'],
+      state,
+      request_comment_id: p.request_comment_id ? String(p.request_comment_id) : null,
+      response_comment_id: p.response_comment_id ? String(p.response_comment_id) : null,
+      subscriber_id: 'cascade-interactive-turn',
+      job_id: p.job_id ? String(p.job_id) : null,
+      execution_plan_version: p.execution_plan_version ? String(p.execution_plan_version) : null,
+      failure_detail: p.failure_detail ? String(p.failure_detail) : null,
+      created_at: ts,
+      updated_at: ts,
+      accepted_at: stamp('accepted'),
+      running_at: stamp('running'),
+      completed_at: stamp('completed'),
+      failed_at: stamp('failed'),
+      timed_out_at: stamp('timed_out'),
+      cancelled_at: stamp('cancelled'),
+    };
+  }
+
+  /** Debounced immediate poll after a comment envelope — collapse bursts
+   *  (thinking + reply) into one fetch. */
+  private debouncedCommentPoll(): void {
+    if (this.ssePollDebounce) clearTimeout(this.ssePollDebounce);
+    this.ssePollDebounce = setTimeout(() => {
+      this.ssePollDebounce = null;
+      void this.pollThread();
+    }, 250);
+  }
+
+  /** Tear down the SSE stream + reconnect/backoff timers. */
+  private disconnectEventStream(): void {
+    this.closeEventSource();
+    if (this.sseReconnectTimer) {
+      clearTimeout(this.sseReconnectTimer);
+      this.sseReconnectTimer = null;
+    }
+    if (this.ssePollDebounce) {
+      clearTimeout(this.ssePollDebounce);
+      this.ssePollDebounce = null;
+    }
+    this.sseThreadId = null;
+  }
+
+  /** Consecutive poll failures — used to surface a persistent transport
+   *  failure visibly (P0-1: "polling failure: silent retry"). */
+  private consecutivePollFailures = 0;
+
+  /** Poll the current thread for new comments from agent roles. */
+  private async pollThread(): Promise<void> {
+    if (!this.threadId || this.isSubmitting) return;
+    const corr = nextCorrelationId();
+    try {
+      const resp = await fetch(`${ASSEMBLY_URL}/api/forums/threads/${this.threadId}`, {
+        headers: { 'X-Request-Id': corr },
+      });
+      if (!resp.ok) {
+        this.notePollFailure(corr, `HTTP ${resp.status}`);
+        return;
+      }
+      this.consecutivePollFailures = 0;
+      const data: AssemblyThread = await resp.json();
+      const comments = data.comments || [];
+      if (comments.length > this.lastCommentCount) {
+        this.lastCommentCount = comments.length;
+        this.syncCommentsToState(comments);
+      }
+      // Pull the latest server-side turn envelope — the authoritative
+      // lifecycle (accepted → running → completed/failed/timed_out). This
+      // replaces comment-count inference for the working indicator.
+      await this.refreshTurnState();
+    } catch {
+      this.notePollFailure(corr, 'network error');
+    }
+  }
+
+  /** Fetch the latest turn envelope for the current thread and reconcile
+   *  the working indicator + no-response timer against it. Best-effort: a
+   *  failed turn fetch never breaks the comment poll. */
+  private async refreshTurnState(): Promise<void> {
+    if (!this.threadId) return;
+    try {
+      const resp = await fetch(
+        `${ASSEMBLY_URL}/api/duality/turns/latest?threadId=${encodeURIComponent(this.threadId)}`,
+        { headers: { 'X-Request-Id': nextCorrelationId() } }
+      );
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const turn: TurnState | null = data?.turn ?? null;
+      this.turnStateSubject.next(turn);
+      if (!turn) return;
+      // Reconcile the in-flight indicator: accepted/running = working;
+      // any terminal state = not working. A terminal envelope that is
+      // OLDER than the most recent send is the previous turn — ignore it
+      // so the working indicator doesn't clear before the subscriber
+      // creates the new turn's envelope.
+      const turnTime = Date.parse(turn.updated_at || turn.created_at) || 0;
+      if (turnTime < this.lastSendAt) return;
+      const inFlight = turn.state === 'accepted' || turn.state === 'running';
+      if (!inFlight) {
+        this.agentWorkingSubject.next(false);
+        this.clearNoResponseTimer();
+      }
+    } catch {
+      // best-effort — comment polling is the resilient path
+    }
+  }
+
+  /** Count a poll failure; surface a visible message after the second
+   *  consecutive failure (≈6s), once. The next successful poll clears it. */
+  private notePollFailure(corr: string, why: string): void {
+    this.consecutivePollFailures++;
+    if (this.consecutivePollFailures !== 2) return;
+    const sysMsg: ChatMessage = {
+      id: 'err-poll-' + Date.now(),
+      role: 'system',
+      content: `⚠️  Connection to assembly-srv lost (${why}) — still retrying. Agent replies may be delayed. (${corr})`,
+      timestamp: new Date(),
+    };
+    const current = this.architectChatSubject.getValue();
+    this.architectChatSubject.next([...current, sysMsg]);
+  }
+
+  /** Convert Assembly comments to ChatMessage and AgentLog arrays. */
+  private syncCommentsToState(comments: AssemblyComment[]): void {
+    const leftMessages: ChatMessage[] = [];
+    const rightLogs: AgentLog[] = [];
+
+    for (const c of comments) {
+      const role = c.role || 'user';
+      const author = c.author?.alias || c.author?.name || role;
+      const timestamp = new Date(c.createdAt);
+      const body = c.body || '';
+
+      // Messages from the left-panel role or user → ArchitectChat.
+      // System-role comments are pipeline noise EXCEPT the subscriber's
+      // failure reports ("[system] Agent X encountered an error: …") —
+      // those MUST reach the user, or errors look like silent timeouts.
+      if (role === this.leftRole || role === 'user') {
+        leftMessages.push({
+          id: c.id,
+          role: role === 'user' ? 'user' : 'architect',
+          content: body,
+          timestamp,
+        });
+      } else if (role === 'thinking') {
+        // The agent's reasoning trace (posted by the subscriber before the
+        // response) — rendered as a collapsible "thinking" block, Freebuff
+        // style. Kept out of the builder/stream panel.
+        leftMessages.push({
+          id: c.id,
+          role: 'thinking',
+          content: body,
+          timestamp,
+        });
+      } else if (role === 'system' && this.isSystemErrorComment(body)) {
+        leftMessages.push({
+          id: c.id,
+          role: 'system',
+          content: body,
+          timestamp,
+        });
+        // The error comment IS the response for this turn — the subscriber
+        // already failed fast (e.g. lease gate). Clear the no-response
+        // timer so the user doesn't get a spurious timeout notice on top,
+        // and surface the failure in the stream panel as a red entry too.
+        this.clearNoResponseTimer();
+        this.agentWorkingSubject.next(false);
+        rightLogs.push({
+          id: c.id + '-err',
+          agent: 'builder',
+          action: 'Error',
+          details: body.slice(0, 500),
+          status: 'error',
+          timestamp,
+        });
+      }
+
+      // Messages from the right-panel role → BuilderStream
+      if (role === this.rightRole) {
+        rightLogs.push({
+          id: c.id,
+          agent: 'builder',
+          action: role,
+          details: body.slice(0, 500),
+          status: 'success',
+          timestamp,
+        });
+      }
+
+      // Agent response arrived — clear the no-response timeout and the
+      // in-flight working indicator (the synthetic pending log is dropped by
+      // this rebuild).
+      if (role === this.leftRole || role === this.rightRole) {
+        this.clearNoResponseTimer();
+        this.agentWorkingSubject.next(false);
+      }
+
+      // Agent-to-agent delegation: left role's message that mentions right role
+      if (role === this.leftRole && body.includes(`@${this.rightRole}`)) {
+        rightLogs.push({
+          id: c.id + '-delegation',
+          agent: 'architect',
+          action: `Delegates to ${this.rightRole}`,
+          details: body.slice(0, 300),
+          status: 'pending',
+          timestamp,
+        });
+      }
+    }
+
+    this.architectChatSubject.next(leftMessages);
+    this.builderLogsSubject.next(rightLogs);
+  }
+
+  /** Ensure a session_watch exists for the current thread. */
+  private async ensureWatch(): Promise<void> {
+    if (this.watchCreated || !this.threadId) return;
+    const corr = nextCorrelationId();
+    try {
+      const resp = await fetch(`${ASSEMBLY_URL}/api/duality/watches`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': corr },
+        body: JSON.stringify({
+          threadId: this.threadId,
+          forumSlug: FORUM_SLUG,
+          role: this.leftRole,
+          executionBackend: this.executionBackend,
+          maxTurns: 20,
+          idleTimeoutMs: 300_000,
+        }),
+      });
+      // P0-1: a 4xx/5xx here is NOT a created watch — don't mark it as one,
+      // or the subscriber silently never gets told to respond.
+      if (!resp.ok) {
+        const errBody = (await resp.text().catch(() => '')) || resp.statusText;
+        throw new Error(`HTTP ${resp.status}: ${errBody.slice(0, 200)}`);
+      }
+      this.watchCreated = true;
+    } catch (err) {
+      console.error('[AssemblyBackend] Failed to create session watch:', err);
+      // Surface as a system message so the user sees the problem
+      const sysMsg: ChatMessage = {
+        id: 'err-watch-' + Date.now(),
+        role: 'system',
+        content: `⚠️  Could not create session watch for **${this.leftRole}** — the subscriber won't know to respond. Is assembly-srv running? (${err instanceof Error ? err.message : String(err)}) [${corr}]`,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, sysMsg]);
+    }
+  }
+
+  /** True when the thread has an active watch using the selected backend.
+   *
+   *  Used by ensureThread() to decide whether a server-side session lookup
+   *  should be resumed: a watch created with a different execution_backend
+   *  (e.g. a live freebuff session) must not be reused for a harness session.
+   *  On lookup failure we allow the resume (status quo behavior).
+   */
+  private async activeWatchMatchesBackend(threadId: string): Promise<boolean> {
+    try {
+      const resp = await fetch(`${ASSEMBLY_URL}/api/duality/watches/${threadId}`);
+      if (!resp.ok) return true;
+      const watches = await resp.json();
+      return watches.some(
+        (w: { status: string; execution_backend: string }) =>
+          w.status === 'active' && w.execution_backend === this.executionBackend
+      );
+    } catch {
+      return true; // network hiccup — allow resume
+    }
+  }
+
+  /** True when a system comment is a subscriber failure report, not noise. */
+  private isSystemErrorComment(body: string): boolean {
+    const b = body.toLowerCase();
+    return (
+      body.startsWith('[system]') &&
+      (b.includes('encountered an error') || b.includes('failed') || b.includes('error'))
+    );
+  }
+
+  /** Arm a no-response timer — if no agent reply arrives within the
+   *  backend's timeout (90s freebuff / 30s harness), surface an error. */
+  private armNoResponseTimer(): void {
+    this.clearNoResponseTimer();
+    const timeoutMs = NO_RESPONSE_TIMEOUT_MS[this.executionBackend];
+    this.noResponseTimer = setTimeout(() => {
+      void this.surfaceTimeoutDiagnostics();
+    }, timeoutMs);
+  }
+
+  /**
+   * Surface a timeout with diagnostics from the server-side watch, instead
+   * of a blind "no response" notice. When the subscriber already failed and
+   * posted a system error comment, that error is surfaced by
+   * syncCommentsToState; this fills the gap when nothing was posted.
+   */
+  private async surfaceTimeoutDiagnostics(): Promise<void> {
+    let detail = '';
+    if (this.threadId) {
+      try {
+        // Bound the diagnostics fetch — a hung assembly-srv must never
+        // delay the timeout notice itself.
+        const controller = new AbortController();
+        const abort = setTimeout(() => controller.abort(), 5000);
+        let resp: Response;
+        try {
+          resp = await fetch(`${ASSEMBLY_URL}/api/duality/watches/${this.threadId}`, {
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(abort);
+        }
+        if (resp.ok) {
+          const watches: Array<{ status: string; execution_backend: string; role: string }> = await resp.json();
+          const watch = watches.find(w => w.role === this.leftRole) || watches[0];
+          if (watch) {
+            if (watch.status === 'closed') {
+              detail = `\n\nSession watch is **closed** — the subscriber finished (or errored) without posting a reply. If a red error message above shows the failure, that's the cause.`;
+            } else if (watch.status === 'paused') {
+              detail = `\n\nSession watch is **paused** — the subscriber is not processing this thread.`;
+            } else {
+              detail = `\n\nSession watch is still **active** (${watch.execution_backend} backend) — the agent may be slow, or the subscriber daemon may be stuck.`;
+            }
+          } else {
+            detail = `\n\nNo active watch found for this thread — the subscriber is not managing it.`;
+          }
+        }
+      } catch {
+        // Diagnostics fetch failed — fall through to the generic message
+      }
+    }
+
+    const timeoutSec = NO_RESPONSE_TIMEOUT_MS[this.executionBackend] / 1000;
+    const sysMsg: ChatMessage = {
+      id: 'err-timeout-' + Date.now(),
+      role: 'system',
+      content: `⏳  No response from **${this.leftRole}** within ${timeoutSec}s. The subscriber daemon may be down or the role lease may be inactive. Check \`systemctl --user status cascade-interactive-turn\`.${detail}`,
+      timestamp: new Date(),
+    };
+    const current = this.architectChatSubject.getValue();
+    this.architectChatSubject.next([...current, sysMsg]);
+    // End the in-flight indicator and show the timeout as a red stream entry.
+    this.agentWorkingSubject.next(false);
+    this.pushStreamError(`No response from ${this.leftRole} within ${timeoutSec}s.${detail}`);
+  }
+
+  private clearNoResponseTimer(): void {
+    if (this.noResponseTimer) {
+      clearTimeout(this.noResponseTimer);
+      this.noResponseTimer = null;
+    }
+  }
+
+  /** Send a user message to the agent via Assembly. */
+  async sendUserMessage(content: string): Promise<void> {
+    if (!content.trim() || this.isSubmitting) return;
+    this.isSubmitting = true;
+
+    try {
+      const tid = await this.ensureThread();
+
+      // 0. Mark the send time + drop any stale turn envelope so the UI
+      //    doesn't render the previous turn's terminal state while the new
+      //    turn is being accepted server-side.
+      this.lastSendAt = Date.now();
+      this.turnStateSubject.next(null);
+      const userMsg: ChatMessage = {
+        id: 'user-' + Date.now(),
+        role: 'user',
+        content,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, userMsg]);
+
+      // 2. Post the message EVENT-FIRST via the durable session-event stream
+      //    (P2 item 9): POST /api/duality/sessions/:id/messages writes the
+      //    comment.created envelope (the source) and projects the Assembly
+      //    comment (the render) in one transaction, so the subscriber
+      //    dispatches from the event stream — Assembly comments are no longer
+      //    the transport. CHECK the response: a failed post (subscriber/forum
+      //    down, thread closed) must reach the user immediately, not silently
+      //    wait out the timeout.
+      const postResp = await fetch(`${ASSEMBLY_URL}/api/duality/sessions/${tid}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Request-Id': nextCorrelationId() },
+        body: JSON.stringify({
+          body: content,
+          postedById: ENGINEER_ID,
+          role: 'user',
+          model: 'freebuff/deepseek-v4-flash',
+        }),
+      });
+      if (!postResp.ok) {
+        const errBody = (await postResp.text().catch(() => '')) || postResp.statusText;
+        throw new Error(`Failed to post message (HTTP ${postResp.status}): ${errBody.slice(0, 300)}`);
+      }
+
+      // 3. Arm timeout — surface error if no response within the backend
+      //    timeout (90s freebuff / 30s harness)
+      this.armNoResponseTimer();
+
+      // 4. In-flight turn indicator: the streaming cursor in the chat panel
+      //    and the pending "working" card in the stream panel turn on now,
+      //    and turn off when the agent's reply comment arrives (poll).
+      this.agentWorkingSubject.next(true);
+      const pendingLog: AgentLog = {
+        id: 'pending-' + Date.now(),
+        agent: this.leftRole,
+        action: 'Working on your request',
+        details: content.slice(0, 200),
+        status: 'pending',
+        timestamp: new Date(),
+      };
+      this.builderLogsSubject.next([...this.builderLogsSubject.getValue(), pendingLog]);
+
+      // 5. Poll immediately for the response (frontend polling handles
+      //    the case where the subscriber daemon isn't running yet)
+      await this.pollThread();
+    } catch (err) {
+      console.error('[AssemblyBackend] sendUserMessage error:', err);
+      this.agentWorkingSubject.next(false);
+      // The lookup-failure path already pushed its own visible system message
+      // — don't double-report it here (P0-1).
+      if (err instanceof SessionLookupUnavailableError) return;
+      // Surface the actual error to the user instead of a silent timeout
+      const sysMsg: ChatMessage = {
+        id: 'err-send-' + Date.now(),
+        role: 'system',
+        content: `⚠️  Failed to send message: ${err instanceof Error ? err.message : String(err)}`,
+        timestamp: new Date(),
+      };
+      const current = this.architectChatSubject.getValue();
+      this.architectChatSubject.next([...current, sysMsg]);
+      this.pushStreamError(`Failed to send message: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.isSubmitting = false;
+    }
+  }
+
+  /** Push an error entry into the stream panel (right panel). */
+  private pushStreamError(details: string): void {
+    const errLog: AgentLog = {
+      id: 'err-log-' + Date.now(),
+      agent: this.leftRole,
+      action: 'Error',
+      details: details.slice(0, 500),
+      status: 'error',
+      timestamp: new Date(),
+    };
+    this.builderLogsSubject.next([...this.builderLogsSubject.getValue(), errLog]);
+  }
+
+  /** Clean up polling, timers, and the SSE stream on destroy. */
+  destroy(): void {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.disconnectEventStream();
+    this.clearNoResponseTimer();
+  }
+
+  // ── Legacy workspace stubs (sidebar compatibility) ───
+
+  setActiveWorkspace(ws: Workspace): void {
+    this.activeWorkspaceSubject.next(ws);
+  }
+}
+
+// Singleton — persisted on globalThis so Vite HMR re-execution of this module
+// reuses the SAME instance (and the same rxjs subjects). Without this, every
+// hot update of this file creates a fresh BackendService whose subjects nobody
+// is subscribed to: sends still hit the DB, but the chat UI never sees them —
+// messages look 'eaten'. Long-lived dev tabs hit this after any service edit.
+const BACKEND_SERVICE_KEY = '__duality_backend_service__';
+const backendGlobal = globalThis as unknown as {
+  [BACKEND_SERVICE_KEY]?: AssemblyBackendService;
+};
+export const BackendService: AssemblyBackendService =
+  backendGlobal[BACKEND_SERVICE_KEY] ??
+  (backendGlobal[BACKEND_SERVICE_KEY] = new AssemblyBackendService());

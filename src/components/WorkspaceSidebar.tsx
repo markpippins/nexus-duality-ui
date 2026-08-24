@@ -5,7 +5,8 @@ import { cn } from '../lib/utils';
 
 export function WorkspaceSidebar() {
   const { workspaces, activeWorkspace, BackendService } = useSimulation();
-  const [collapsed, setCollapsed] = useState(false);
+  // Collapsed by default — sidebars are placeholder stubs until populated (see To Do roadmap)
+  const [collapsed, setCollapsed] = useState(true);
 
   if (collapsed) {
     return (
@@ -19,7 +20,7 @@ export function WorkspaceSidebar() {
   return (
     <div className="w-64 h-full border-r border-gray-800 bg-gray-900/50 flex flex-col">
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800/50 hover:bg-gray-800/20 cursor-pointer" onClick={() => setCollapsed(true)}>
-        <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Workspaces</span>
+        <span className="text-sm font-semibold text-gray-400 uppercase tracking-wider">Workspaces</span>
         <ChevronDown className="w-4 h-4 text-gray-500" />
       </div>
       <div className="flex-1 overflow-y-auto p-2 space-y-1">

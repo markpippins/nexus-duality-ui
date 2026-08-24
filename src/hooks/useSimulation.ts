@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { BackendService } from '../services/SimulatedBackendService';
+import { BackendService } from '../services/AssemblyBackendService';
 import { Workspace, FileNode, ChatMessage, AgentLog } from '../types';
 
 export function useSimulation() {
@@ -8,6 +8,7 @@ export function useSimulation() {
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [architectChat, setArchitectChat] = useState<ChatMessage[]>([]);
   const [builderLogs, setBuilderLogs] = useState<AgentLog[]>([]);
+  const [fileTreeError, setFileTreeError] = useState<string | null>(null);
 
   useEffect(() => {
     const subs = [
@@ -15,10 +16,19 @@ export function useSimulation() {
       BackendService.activeWorkspace$.subscribe(setActiveWorkspace),
       BackendService.fileTree$.subscribe(setFileTree),
       BackendService.architectChat$.subscribe(setArchitectChat),
-      BackendService.builderLogs$.subscribe(setBuilderLogs)
+      BackendService.builderLogs$.subscribe(setBuilderLogs),
+      BackendService.fileTreeError$.subscribe(setFileTreeError),
     ];
 
-    return () => subs.forEach(s => s.unsubscribe());
+    // Live mode: load the real file tree from file-system-server on mount.
+    if (BackendService.isLiveFileMode()) {
+      BackendService.loadLiveFileTree();
+    }
+
+    return () => {
+      subs.forEach(s => s.unsubscribe());
+      BackendService.destroy();
+    };
   }, []);
 
   return {
@@ -27,6 +37,10 @@ export function useSimulation() {
     fileTree,
     architectChat,
     builderLogs,
-    BackendService
+    fileTreeError,
+    isLiveFileMode: BackendService.isLiveFileMode(),
+    readLiveFile: (path: string[], name: string) => BackendService.readLiveFile(path, name),
+    saveLiveFile: (path: string[], name: string, content: string) => BackendService.saveLiveFile(path, name, content),
+    BackendService,
   };
 }
