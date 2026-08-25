@@ -92,6 +92,7 @@ fetchLog = [];
   const svc = fresh();
   responses.push({ status: 404, body: '' });                                     // active watch lookup: no watch
   responses.push({ status: 201, body: JSON.stringify({ id: 't-new' }) });       // create thread
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000001', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease
   responses.push({ status: 201, body: JSON.stringify({ id: 'w-1' }) });         // create watch
   const tid = await svc.ensureThread();
   check('404 on lookup → new thread created', tid === 't-new');
@@ -104,6 +105,7 @@ fetchLog = [];
   responses.push({ status: 200, body: JSON.stringify({ threadId: 't-x' }) });
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // thread verify OK
   responses.push({ status: 200, body: JSON.stringify([]) });                // activeWatchMatchesBackend: no active watch
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000002', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease
   responses.push({ status: 500, body: 'boom' });                            // watch create fails
   await svc.ensureThread();
   const msgs = svc._msgs;
@@ -127,6 +129,8 @@ fetchLog = [];
   responses.push({ status: 200, body: JSON.stringify({ threadId: 't-turn' }) });
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // verify
   responses.push({ status: 200, body: JSON.stringify([]) });                // activeWatchMatchesBackend
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000003', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease for resume
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000003', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease for watch
   responses.push({ status: 201, body: JSON.stringify({ id: 'w-turn' }) });  // watch
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // history
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // first poll
@@ -156,6 +160,8 @@ fetchLog = [];
   responses.push({ status: 200, body: JSON.stringify({ threadId: 't-done' }) });
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // verify
   responses.push({ status: 200, body: JSON.stringify([]) });                // activeWatchMatchesBackend
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000004', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease for resume
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000004', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease for watch
   responses.push({ status: 201, body: JSON.stringify({ id: 'w-done' }) });  // watch
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // history
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // poll
@@ -186,6 +192,8 @@ fetchLog = [];
   responses.push({ status: 200, body: JSON.stringify({ threadId: 't-poll' }) });
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // verify
   responses.push({ status: 200, body: JSON.stringify([]) });                // activeWatchMatchesBackend: no active watch
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000005', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease for resume
+  responses.push({ status: 200, body: JSON.stringify({ items: [{ id: '00000000-0000-0000-0000-000000000005', status: 'ACTIVE', channel: 'interactive', budget_units: 20, consumed_units: 0 }] }) }); // resolve lease for watch
   responses.push({ status: 201, body: JSON.stringify({ id: 'w-2' }) });    // watch create
   responses.push({ status: 200, body: JSON.stringify({ comments: [] }) }); // history
   await svc.ensureThread();

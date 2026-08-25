@@ -2,6 +2,7 @@ import { BehaviorSubject } from 'rxjs';
 import { Workspace, FileNode, ChatMessage, AgentLog } from '../types';
 
 const ASSEMBLY_URL = 'http://localhost:3107';
+const NEBULA_URL = (import.meta as any).env?.VITE_NEBULA_SRV_TARGET || 'http://localhost:3101';
 const FORUM_SLUG = 'duality-sessions';
 const POLL_INTERVAL_MS = 3000;
 const ENGINEER_ID = 'af069ff6-760c-44cb-a0d4-11517164169b';
@@ -56,6 +57,7 @@ export interface TurnState {
   thread_id: string;
   role: string;
   execution_backend: 'operator' | 'harness' | 'freebuff';
+  lease_id: string | null;
   state: 'accepted' | 'running' | 'completed' | 'failed' | 'timed_out' | 'cancelled';
   request_comment_id: string | null;
   response_comment_id: string | null;
@@ -266,6 +268,7 @@ export class AssemblyBackendService {
   private lastCommentCount = 0;
   private isSubmitting = false;
   private watchCreated = false;
+  private leaseId: string | null = null;
   private noResponseTimer: ReturnType<typeof setTimeout> | null = null;
   /** Epoch ms of the most recent send — terminal turn envelopes older than
    *  this are the PREVIOUS turn, so they must not clear the in-flight
@@ -300,6 +303,7 @@ export class AssemblyBackendService {
     this.agentWorkingSubject.next(false);
     this.turnStateSubject.next(null);
     this.watchCreated = false;
+    this.leaseId = null;
     this.lastCommentCount = 0;
     this.sessionGen++;
     // Stop polling on the old thread + cancel any pending no-response
@@ -331,6 +335,7 @@ export class AssemblyBackendService {
     this.agentWorkingSubject.next(false);
     this.turnStateSubject.next(null);
     this.watchCreated = false;
+    this.leaseId = null;
     this.lastCommentCount = 0;
     this.sessionGen++;
     if (this.pollTimer) {
@@ -385,6 +390,7 @@ export class AssemblyBackendService {
     this.agentWorkingSubject.next(false);
     this.turnStateSubject.next(null);
     this.watchCreated = false;
+    this.leaseId = null;
     this.lastCommentCount = 0;
     this.sessionGen++;
     await this.loadThreadHistory();
@@ -408,6 +414,7 @@ export class AssemblyBackendService {
     this.agentWorkingSubject.next(false);
     this.turnStateSubject.next(null);
     this.watchCreated = false;
+    this.leaseId = null;
     this.lastCommentCount = 0;
     this.sessionGen++;
     // Fire-and-forget: the panels re-render via architectChat$ once the new
@@ -705,6 +712,7 @@ export class AssemblyBackendService {
       thread_id: d?.threadId ?? this.threadId ?? '',
       role: String(p.role ?? this.leftRole),
       execution_backend: (p.backend ?? this.executionBackend) as TurnState['execution_backend'],
+      lease_id: p.lease_id ? String(p.lease_id) : null,
       state,
       request_comment_id: p.request_comment_id ? String(p.request_comment_id) : null,
       response_comment_id: p.response_comment_id ? String(p.response_comment_id) : null,
@@ -918,11 +926,41 @@ export class AssemblyBackendService {
     this.builderLogsSubject.next(rightLogs);
   }
 
+  /** Resolve the exact active interactive lease immediately before watch creation.
+   *  A watch must never be created with an implicit role-level lease. */
+  private async resolveInteractiveLeaseId(): Promise<string | null> {
+    if (this.executionBackend !== 'freebuff') return null;
+    const resp = await fetch(
+      `${NEBULA_URL}/api/role-leases?role=${encodeURIComponent(this.leftRole)}&channel=interactive&status=ACTIVE`,
+      { headers: { 'X-Request-Id': nextCorrelationId() } },
+    );
+    if (!resp.ok) throw new Error(`Failed to resolve active role lease (HTTP ${resp.status})`);
+    const data = await resp.json() as { items?: Array<{
+      id?: string;
+      status?: string;
+      channel?: string;
+      expires_at?: string | null;
+      budget_units?: number | null;
+      consumed_units?: number;
+    }> };
+    const now = Date.now();
+    const lease = (data.items ?? []).find((candidate) => {
+      if (!candidate.id || candidate.status !== 'ACTIVE' || candidate.channel !== 'interactive') return false;
+      if (candidate.expires_at && Date.parse(candidate.expires_at) <= now) return false;
+      if (candidate.budget_units !== null && candidate.budget_units !== undefined
+          && (candidate.consumed_units ?? 0) >= candidate.budget_units) return false;
+      return true;
+    });
+    return lease?.id ?? null;
+  }
+
   /** Ensure a session_watch exists for the current thread. */
   private async ensureWatch(): Promise<void> {
     if (this.watchCreated || !this.threadId) return;
     const corr = nextCorrelationId();
     try {
+      const resolvedLeaseId = await this.resolveInteractiveLeaseId();
+      this.leaseId = resolvedLeaseId;
       const resp = await fetch(`${ASSEMBLY_URL}/api/duality/watches`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Request-Id': corr },
@@ -933,6 +971,7 @@ export class AssemblyBackendService {
           executionBackend: this.executionBackend,
           maxTurns: 20,
           idleTimeoutMs: 300_000,
+          ...(resolvedLeaseId ? { leaseId: resolvedLeaseId } : {}),
         }),
       });
       // P0-1: a 4xx/5xx here is NOT a created watch — don't mark it as one,
@@ -967,10 +1006,21 @@ export class AssemblyBackendService {
     try {
       const resp = await fetch(`${ASSEMBLY_URL}/api/duality/watches/${threadId}`);
       if (!resp.ok) return true;
-      const watches = await resp.json();
+      const watches = await resp.json() as Array<{
+        status: string;
+        execution_backend: string;
+        lease_id?: string | null;
+      }>;
+      if (this.executionBackend !== 'freebuff') {
+        return watches.some(
+          (w) => w.status === 'active' && w.execution_backend === this.executionBackend,
+        );
+      }
+      const currentLeaseId = await this.resolveInteractiveLeaseId();
       return watches.some(
-        (w: { status: string; execution_backend: string }) =>
-          w.status === 'active' && w.execution_backend === this.executionBackend
+        (w) => w.status === 'active' &&
+          w.execution_backend === this.executionBackend &&
+          Boolean(w.lease_id) && w.lease_id === currentLeaseId,
       );
     } catch {
       return true; // network hiccup — allow resume
